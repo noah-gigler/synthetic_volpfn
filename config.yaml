@@ -1,0 +1,21 @@
+ssvi_prior:
+  v_bar:
+    median: 0.04      # 20% ATM vol (historical SPX)
+    sigma: 0.5        # 12-33% vol at 5th-95th pct
+
+  # v0 = v_bar * r
+  r:  
+    median: 1.0         # on average v0 = v_bar
+    sigma: 0.35       # 0.5-2 at 5th-95th pct
+
+  kappa:
+    median: 2.0         
+    sigma: 0.7        # 0.5-7 at 5th-95th pct
+
+  rho:
+    median: 0.7       # -0.7 skew (historical SPX) listed as |rho| 
+    sigma: 0.5        # -0.9,-0.4 at 5th-95th pct
+
+  gamma:
+    median: 0.5       # typically 0.5 
+    sigma: 0.5
