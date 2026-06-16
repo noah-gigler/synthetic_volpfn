@@ -10,7 +10,6 @@ def logitnormal(median, sigma, size):
 # Max η satisfying Theorem 4.2 (Gatheral & Jacquier 2013) butterfly arbitrage conditions:
 #   1. θφ(θ)(1+|ρ|) < 4  →  η(1+|ρ|) < 4
 #   2. θφ(θ)²(1+|ρ|) ≤ 4 →  η ≤ 2/sqrt(B(θ_min)·(1+|ρ|))
-# Condition 2 is binding over condition 1 when γ > 0.5, since B(θ) → ∞ as θ → 0.
 def max_eta(rho, v_bar, v0, kappa, gamma):
     bound1 = 4 / (1 + np.abs(rho))
     t_min = 0.1
@@ -19,6 +18,7 @@ def max_eta(rho, v_bar, v0, kappa, gamma):
     bound2 = 2 / np.sqrt(B_min * (1 + np.abs(rho)))
 
     return np.minimum(bound1, bound2)
+
 
 def sample_params(cfg, n):
     rho = -logitnormal(cfg["rho"]["median"], cfg["rho"]["sigma"], n)
@@ -34,16 +34,16 @@ def sample_params(cfg, n):
 
     return rho, eta, gamma, v_bar, v0, kappa
 
-def ssvi(ttms, log_moneyness, rho, eta, gamma, v_bar, v0, kappa):
+def ssvi(ttms, ks, rho, eta, gamma, v_bar, v0, kappa):
     # dimensional casting for vectorization
-    # returns (n, ttms, ks)
+    # returns (n, dim(ttms), dim(ks))
     ttms = ttms[None, :, None]
-    log_moneyness = log_moneyness[None, None, :]
+    ks = ks[None, None, :]
     rho, eta, gamma, v_bar, v0, kappa = [x[:, None, None] for x in (rho, eta, gamma, v_bar, v0, kappa)]
 
-    thetas = v_bar * ttms + (v0 - v_bar)/kappa * (1 - np.exp(-kappa * ttms))
-    phis   = eta / (thetas**gamma * (1 + thetas)**(1 - gamma))
-    w = thetas/2 * (1 + rho*phis*log_moneyness + np.sqrt((phis*log_moneyness + rho)**2 + (1 - rho**2)))
+    thetas = v_bar * ttms + (v0 - v_bar)/kappa * (1 - np.exp(-kappa * ttms))        # heston like term structure
+    phis = eta / (thetas**gamma * (1 + thetas)**(1 - gamma))                        # modified power law
+    w = thetas/2 * (1 + rho*phis*ks + np.sqrt((phis*ks + rho)**2 + (1 - rho**2)))   # SSVI parametrization
 
     return np.sqrt(w/ttms)
 
@@ -51,7 +51,7 @@ def ssvi(ttms, log_moneyness, rho, eta, gamma, v_bar, v0, kappa):
 if __name__ == "__main__":
     ttms = np.array([0.1, 0.5, 1.0, 1.5, 2.0])
     ks   = np.linspace(-0.5, 0.5, 10)
-    cfg = yaml.safe_load(open("config.yaml"))["ssvi_prior"]
+    cfg = yaml.safe_load(open("config.yaml"))
     rho, eta, gamma, v_bar, v0, kappa = sample_params(cfg, n=1000)
 
     surfaces = ssvi(ttms, ks, rho, eta, gamma, v_bar, v0, kappa) 
