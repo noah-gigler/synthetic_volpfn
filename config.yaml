@@ -27,7 +27,7 @@ gamma:
 k:
   min: -0.5
   max: 0.5
-  n_points: 50
+  n_points: 25
 
 ttm:
   min: 0.1
