@@ -58,69 +58,12 @@ def _build_surface_lists(cfg: dict, n_surfaces: int) -> tuple[list[np.ndarray], 
     return X_list, y_list
 
 
-def _evaluate(
-    estimator: TabPFNRegressor,
-    X_val: list[np.ndarray],
-    y_val: list[np.ndarray],
-    *,
-    n_context: int,
-    rng: np.random.Generator,
-    perf_opts: PerformanceOptions,
-    device: str,
-) -> float:
-    """Mean bar-distribution loss over a fixed validation set (no gradient)."""
-    split_fn = partial(_context_query_split, n_context=n_context, rng=rng)
-    val_datasets = get_preprocessed_dataset_chunks(
-        calling_instance=estimator,
-        X_raw=X_val,
-        y_raw=y_val,
-        split_fn=split_fn,
-        max_data_size=None,
-        model_type="regressor",
-        equal_split_size=False,
-        data_shuffle_seed=0,
-        preprocessing_random_state=rng,
-        shuffle=False,
-    )
-    dataloader = DataLoader(val_datasets, batch_size=1, collate_fn=meta_dataset_collator, shuffle=False)
-
-    estimator.model_.eval()
-    total_loss = 0.0
-    with torch.no_grad():
-        for batch in dataloader:
-            estimator.raw_space_bardist_ = batch.raw_space_bardist
-            estimator.znorm_space_bardist_ = batch.znorm_space_bardist
-
-            estimator.fit_from_preprocessed(
-                batch.X_context, batch.y_context, batch.cat_indices, batch.configs,
-                performance_options=perf_opts, no_refit=True,
-            )
-            _, per_estim_logits, _ = estimator.forward(batch.X_query, use_inference_mode=False)
-
-            logits_QBEL = torch.stack(per_estim_logits, dim=2)
-            Q, B, E, L = logits_QBEL.shape
-            logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
-            targets_BQ = batch.y_query.repeat(B * E, 1).to(device)
-
-            loss = _compute_regression_loss(
-                logits_BQL=logits_BQL,
-                targets_BQ=targets_BQ,
-                bardist_loss_fn=batch.znorm_space_bardist,
-                ce_loss_weight=1.0,
-            )
-            total_loss += loss.item()
-    estimator.model_.train()
-
-    return total_loss / max(len(dataloader), 1)
-
-
 def finetune(
     cfg: dict,
     *,
     n_epochs: int = 50,
     n_surfaces_per_epoch: int = 200,
     n_context: int = 10,
-    n_val_surfaces: int = 30,
     lr: float = 1e-5,
     weight_decay: float = 0.01,
     grad_clip: float = 1.0,
@@ -145,11 +88,6 @@ def finetune(
     optimizer = AdamW(estimator.model_.parameters(), lr=lr, weight_decay=weight_decay)
     perf_opts = PerformanceOptions(force_recompute_layer=False, use_chunkwise_inference=False)
     rng = np.random.default_rng(seed)
-
-    # Fixed held-out validation surfaces (generated once, never trained on)
-    X_val, y_val = _build_surface_lists(cfg, n_val_surfaces)
-    val_rng = np.random.default_rng(seed + 999)
-    best_val_loss = float("inf")
 
     log.info("Starting finetuning: %d epochs x %d surfaces, n_context=%d", n_epochs, n_surfaces_per_epoch, n_context)
 
@@ -220,23 +158,12 @@ def finetune(
             epoch_loss += loss.item()
 
         mean_loss = epoch_loss / max(len(dataloader), 1)
+        log.info("Epoch %d/%d | loss=%.4f", epoch + 1, n_epochs, mean_loss)
 
-        val_loss = _evaluate(
-            estimator, X_val, y_val,
-            n_context=n_context, rng=val_rng, perf_opts=perf_opts, device=device,
-        )
+        torch.save(estimator.model_.state_dict(), out / f"epoch_{epoch + 1:03d}.pt")
 
-        improved = val_loss < best_val_loss
-        if improved:
-            best_val_loss = val_loss
-            torch.save(estimator.model_.state_dict(), out / "best.pt")
-
-        log.info(
-            "Epoch %d/%d | train_loss=%.4f | val_loss=%.4f%s",
-            epoch + 1, n_epochs, mean_loss, val_loss, "  (saved best.pt)" if improved else "",
-        )
-
-    log.info("Best val_loss=%.4f -> %s/best.pt", best_val_loss, out)
+    torch.save(estimator.model_.state_dict(), out / "final.pt")
+    log.info("Saved final model to %s/final.pt", out)
     return estimator
 
 
