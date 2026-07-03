@@ -28,7 +28,6 @@ from torch.utils.data import DataLoader
 
 from tabpfn import TabPFNRegressor
 from tabpfn.architectures.interface import PerformanceOptions
-from tabpfn.constants import ModelVersion
 from tabpfn.finetuning.data_util import get_preprocessed_dataset_chunks, meta_dataset_collator
 from tabpfn.finetuning.finetuned_regressor import _compute_regression_loss
 
@@ -75,11 +74,11 @@ def finetune(
     out.mkdir(parents=True, exist_ok=True)
 
     # ---------- model setup ----------
-    estimator = TabPFNRegressor.create_default_for_version(
-        version=ModelVersion.V3,
+    estimator = TabPFNRegressor(
         fit_mode="batched",
-        n_estimators=1,
+        n_estimators=2,
         device=device,
+        inference_config={"FINGERPRINT_FEATURE": False},
     )
     estimator._initialize_model_variables()
     estimator.model_.to(device)
