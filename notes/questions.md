@@ -10,6 +10,10 @@ How many sparse points to provide?
 
 
 
+do we want to provide context or one prediction just takes in the sparse qoutes and nothing else?
+
+
+
 
 
 
