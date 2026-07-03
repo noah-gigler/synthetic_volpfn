@@ -1,27 +1,16 @@
-"""
-Meta-learning finetuning loop for TabPFN on synthetic SSVI vol surfaces.
 
-Each gradient step processes one synthetic surface:
-  1. Sample a full SSVI surface (n_k * n_ttm grid points)
-  2. Split into context (Gaussian ATM-weighted) and query (remaining points)
-  3. Preprocess via TabPFN's pipeline (standardization, ensemble preprocessing)
-  4. Cache context in TabPFN executor (no gradient)
-  5. Differentiable forward on query -> bar distribution logits
-  6. Cross-entropy loss on bar distribution -> backprop -> AdamW step
-
-Run:
-    python -m src.model.finetune
-"""
-
-from __future__ import annotations
+# Meta-learning finetuning loop for TabPFN, data-agnostic.
+#   1. Preprocess via TabPFN's pipeline (standardization, ensemble preprocessing)
+#   2. Cache context in TabPFN executor (no gradient)
+#   3. Differentiable forward on query -> bar distribution logits
+#   4. Cross-entropy loss on bar distribution -> backprop -> AdamW step
 
 import logging
-from functools import partial
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
-import yaml
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -31,52 +20,36 @@ from tabpfn.architectures.interface import PerformanceOptions
 from tabpfn.finetuning.data_util import get_preprocessed_dataset_chunks, meta_dataset_collator
 from tabpfn.finetuning.finetuned_regressor import _compute_regression_loss
 
-from src.data_generation.data_preperation import generate_surfaces
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
-
-def _context_query_split(X: np.ndarray, y: np.ndarray, *, n_context: int, rng: np.random.Generator, stratify=None):
-    """Gaussian ATM-weighted context sampling; returns (X_ctx, X_query, y_ctx, y_query)."""
-    k_weights = np.exp(-0.5 * (X[:, 0] / 0.25) ** 2)
-    k_weights /= k_weights.sum()
-    ctx_idx = rng.choice(len(X), size=n_context, replace=False, p=k_weights)
-    query_idx = np.setdiff1d(np.arange(len(X)), ctx_idx)
-    return X[ctx_idx], X[query_idx], y[ctx_idx], y[query_idx]
+DataProvider = Callable[[int], tuple[list[tuple[np.ndarray, np.ndarray]], list[tuple[np.ndarray, np.ndarray]]]]
 
 
-def _build_surface_lists(cfg: dict, n_surfaces: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Generate n_surfaces SSVI surfaces as flat [k, tau] -> implied_vol arrays."""
-    ttms, ks, surfaces = generate_surfaces(cfg, n_surfaces)
-    TT, KK = np.meshgrid(ttms, ks, indexing="ij")
-    X_flat = np.column_stack([KK.ravel(), TT.ravel()]).astype(np.float32)
-
-    X_list = [X_flat.copy() for _ in range(n_surfaces)]
-    y_list = [surfaces[i].ravel().astype(np.float32) for i in range(n_surfaces)]
-    return X_list, y_list
+def _fixed_context_split_fn(n_context: int):
+    def split_fn(X: np.ndarray, y: np.ndarray, stratify=None):
+        return X[:n_context], X[n_context:], y[:n_context], y[n_context:]
+    return split_fn
 
 
 def finetune(
-    cfg: dict,
+    data_provider: DataProvider,
     *,
     n_epochs: int = 50,
     n_surfaces_per_epoch: int = 200,
-    n_context: int = 10,
     lr: float = 1e-5,
     weight_decay: float = 0.01,
     grad_clip: float = 1.0,
     output_dir: str = "checkpoints/finetune_v1",
     device: str = "cpu",
-    seed: int = 42,
+    seed: int = 0,
 ) -> TabPFNRegressor:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # ---------- model setup ----------
     estimator = TabPFNRegressor(
         fit_mode="batched",
-        n_estimators=2,
+        n_estimators=1,
         device=device,
         inference_config={"FINGERPRINT_FEATURE": False},
     )
@@ -88,19 +61,21 @@ def finetune(
     perf_opts = PerformanceOptions(force_recompute_layer=False, use_chunkwise_inference=False)
     rng = np.random.default_rng(seed)
 
-    log.info("Starting finetuning: %d epochs x %d surfaces, n_context=%d", n_epochs, n_surfaces_per_epoch, n_context)
+    log.info("Starting finetuning: %d epochs x %d datasets", n_epochs, n_surfaces_per_epoch)
 
     for epoch in range(n_epochs):
-        X_list, y_list = _build_surface_lists(cfg, n_surfaces_per_epoch)
+        train, test = data_provider(n_surfaces_per_epoch)
+        n_context = len(train[0][0])
 
-        split_fn = partial(_context_query_split, n_context=n_context, rng=rng)
+        X_list = [np.concatenate([X_tr, X_te]) for (X_tr, _), (X_te, _) in zip(train, test)]
+        y_list = [np.concatenate([y_tr, y_te]) for (_, y_tr), (_, y_te) in zip(train, test)]
 
         training_datasets = get_preprocessed_dataset_chunks(
             calling_instance=estimator,
             X_raw=X_list,
             y_raw=y_list,
-            split_fn=split_fn,
-            max_data_size=None,   # one surface = one dataset chunk; no intra-surface splitting
+            split_fn=_fixed_context_split_fn(n_context),
+            max_data_size=None, 
             model_type="regressor",
             equal_split_size=False,
             data_shuffle_seed=seed + epoch,
@@ -119,12 +94,12 @@ def finetune(
         for batch in dataloader:
             optimizer.zero_grad()
 
-            # Register bar distribution for this surface's target statistics
+            # each dataset has its own target statistics for the bar distribution
             estimator.raw_space_bardist_ = batch.raw_space_bardist
             estimator.znorm_space_bardist_ = batch.znorm_space_bardist
             bardist_loss_fn = batch.znorm_space_bardist
 
-            # Cache context in executor (no gradient flows through here)
+            # cache context in executor - no gradient flows through this
             estimator.fit_from_preprocessed(
                 batch.X_context,
                 batch.y_context,
@@ -134,10 +109,10 @@ def finetune(
                 no_refit=True,
             )
 
-            # Differentiable forward on query points
+            # differentiable forward on query points
             _, per_estim_logits, _ = estimator.forward(batch.X_query, use_inference_mode=False)
 
-            # Reshape: list of [Q, B, L] -> [B*E, Q, L]
+            # list of [Q, B, L] per estimator -> [B*E, Q, L]
             logits_QBEL = torch.stack(per_estim_logits, dim=2)
             Q, B, E, L = logits_QBEL.shape
             logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
@@ -167,5 +142,10 @@ def finetune(
 
 
 if __name__ == "__main__":
+    import yaml
+    from functools import partial
+    from src.data_generation.data_preperation import data_preparation
+
     cfg = yaml.safe_load(open("config.yaml"))
-    finetune(cfg, n_epochs=1, n_surfaces_per_epoch=2, n_context=10)
+    data_provider = partial(data_preparation, cfg, n_context=10)
+    finetune(data_provider, n_epochs=1, n_surfaces_per_epoch=2)

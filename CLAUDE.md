@@ -29,22 +29,31 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   `sample_sparse_points` draws a Gaussian ATM-weighted, uniform-in-ttm subset of grid indices as the
   "sparse quotes" context; `data_preparation` builds the corresponding train/test `(X=[k,tau], y=iv)` arrays
   per surface. Has a `__main__` smoke test that fits/predicts a single surface with vanilla `TabPFNRegressor`.
-- **`src/model/finetune.py`** — the actual meta-learning finetuning loop. Each gradient step processes one
-  synthetic surface: sample it, split into context/query (same ATM-weighted scheme as above), run TabPFN's
-  own preprocessing pipeline (`get_preprocessed_dataset_chunks`), cache the context into the TabPFN executor
-  with no gradient (`fit_from_preprocessed(..., no_refit=True)`), then do a differentiable forward pass on
-  the query points to get bar-distribution logits and backprop a regression loss (`_compute_regression_loss`)
-  against the model's own bar-distribution buckets. Saves a checkpoint every epoch to `output_dir`
-  (default `checkpoints/finetune_v1/`). Currently SSVI-specific (takes `cfg` directly and builds surfaces
-  inline) — a planned refactor moves data generation/sampling behind a generic
-  `data_provider(n) -> (train, test)` callable so the loop works on other synthetic generators or real data
-  without change; not yet implemented.
+- **`src/model/finetune.py`** — the actual meta-learning finetuning loop, data-agnostic: it takes a
+  `data_provider(n) -> (train, test)` callable (bind dataset-specific config, e.g. `cfg`/`n_context`, via
+  `functools.partial` before passing it in) instead of knowing about SSVI or sampling itself. Each gradient
+  step processes one dataset from the provider: concatenates its pre-split train/test back into one array,
+  re-splits at the fixed context length via `_fixed_context_split_fn` (glue for TabPFN's
+  `get_preprocessed_dataset_chunks` API, which requires a `split_fn`), runs TabPFN's own preprocessing
+  pipeline, caches the context into the TabPFN executor with no gradient
+  (`fit_from_preprocessed(..., no_refit=True)`), then does a differentiable forward pass on the query points
+  to get bar-distribution logits and backprop a regression loss (`_compute_regression_loss`) against the
+  model's own bar-distribution buckets. Saves a checkpoint every epoch to `output_dir`
+  (default `checkpoints/finetune_v1/`).
 - **TabPFN estimator construction** — use plain `TabPFNRegressor(...)`, not
   `TabPFNRegressor.create_default_for_version(version=ModelVersion.V3, ...)`; the plain constructor already
   resolves to the V3 checkpoint by default, so the explicit version selection is redundant. `finetune.py`
-  builds it with `fit_mode="batched"`, `n_estimators=2` (matches the library's own
-  `FinetunedTabPFNRegressor` default for the training phase; bump to 8 for final inference after
-  finetuning), and `inference_config={"FINGERPRINT_FEATURE": False}`.
+  builds it with `fit_mode="batched"`, `n_estimators=1`, and `inference_config={"FINGERPRINT_FEATURE": False}`.
+  **`n_estimators=1` is required for training stability, not just a style choice**: bumping to 2 (to match
+  the library's own `FinetunedTabPFNRegressor` default) mixes TabPFN's two different default preprocessing
+  branches (squashing+SVD vs. quantile_uni) into one training run, and empirically caused the forward pass
+  to emit `-inf` logits within the first epoch, permanently corrupting the model weights once
+  `loss.backward()`/`optimizer.step()` ran on the resulting `inf` loss (loss stays `inf` for every epoch
+  after). This is consistent with `notes/tabpfn_preprocessing_ablation.md`, which already found that
+  ensembling both branches underperforms using the squashing+SVD branch alone at inference time — there's no
+  evidence `n_estimators=2` is worth the instability. Root cause of the `-inf` forward pass itself is not
+  fully diagnosed; if raising `n_estimators` again, re-verify training stability first (e.g. check
+  `torch.isfinite(loss)` every batch before backprop).
 - **`src/evaluation/surface_eval.py`** — `check_arbitrage` checks a predicted/generated surface for
   calendar-spread and butterfly arbitrage violations in total-variance space (`w = iv^2 * ttm`).
 - **`notebooks/`** — exploratory work: `tabpfn_test.ipynb` (baseline, non-finetuned TabPFN on SSVI surfaces),
