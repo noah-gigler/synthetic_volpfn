@@ -14,54 +14,34 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
 
 from tabpfn import TabPFNRegressor
 from tabpfn.architectures.interface import PerformanceOptions
-from tabpfn.finetuning.data_util import get_preprocessed_dataset_chunks, meta_dataset_collator
 from tabpfn.finetuning.finetuned_regressor import _compute_regression_loss
 from tabpfn.finetuning.train_util import get_cosine_schedule_with_warmup
+
+from src.model.preprocessed_dataset import build_regression_batches
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
 DataProvider = Callable[[int], tuple[list[tuple[np.ndarray, np.ndarray]], list[tuple[np.ndarray, np.ndarray]]]]
 
-
-def _fixed_context_split_fn(n_context: int):
-    def split_fn(X: np.ndarray, y: np.ndarray, stratify=None):
-        return X[:n_context], X[n_context:], y[:n_context], y[n_context:]
-    return split_fn
-
-
-def _build_dataloader(estimator, train, test, n_context, *, seed, rng):
-    X_list = [np.concatenate([X_tr, X_te]) for (X_tr, _), (X_te, _) in zip(train, test)]
-    y_list = [np.concatenate([y_tr, y_te]) for (_, y_tr), (_, y_te) in zip(train, test)]
-
-    datasets = get_preprocessed_dataset_chunks(
-        calling_instance=estimator,
-        X_raw=X_list,
-        y_raw=y_list,
-        split_fn=_fixed_context_split_fn(n_context),
-        max_data_size=None,  # one dataset = one chunk; no intra-dataset splitting
-        model_type="regressor",
-        equal_split_size=False,
-        data_shuffle_seed=seed,
-        preprocessing_random_state=rng,
-        shuffle=False,
-    )
-    return DataLoader(datasets, batch_size=1, collate_fn=meta_dataset_collator, shuffle=True)
+# Resolved from this file's location, not cwd, so checkpoints always land in
+# <repo_root>/checkpoints/<run_name> regardless of where finetune() is called from
+# (e.g. a notebook running with cwd=notebooks/).
+_CHECKPOINTS_DIR = Path(__file__).resolve().parents[2] / "checkpoints"
 
 
-def _run_batches(estimator, dataloader, perf_opts, device, *, optimizer=None, scheduler=None, grad_clip=None):
-    """One pass over `dataloader`. Trains (backprop + step) if `optimizer` is given,
+def _run_batches(estimator, batches, perf_opts, device, *, optimizer=None, scheduler=None, grad_clip=None):
+    """One pass over `batches`. Trains (backprop + step) if `optimizer` is given,
     otherwise runs a no-grad validation pass. Returns the mean loss."""
     training = optimizer is not None
     estimator.model_.train(training)
 
     total_loss = 0.0
     with torch.set_grad_enabled(training):
-        for batch in dataloader:
+        for batch in batches:
             if training:
                 optimizer.zero_grad()
 
@@ -108,11 +88,12 @@ def _run_batches(estimator, dataloader, perf_opts, device, *, optimizer=None, sc
             total_loss += loss.item()
 
     estimator.model_.train()
-    return total_loss / max(len(dataloader), 1)
+    return total_loss / max(len(batches), 1)
 
 
 def finetune(
     data_provider: DataProvider,
+    run_name: str,
     *,
     n_epochs: int = 50,
     n_surfaces_per_epoch: int = 200,
@@ -121,12 +102,12 @@ def finetune(
     weight_decay: float = 0.01,
     grad_clip: float = 1.0,
     warmup_ratio: float = 0.1,
-    output_dir: str = "checkpoints/finetune_v1",
     device: str = "cpu",
     seed: int = 0,
 ) -> TabPFNRegressor:
-    out = Path(output_dir)
+    out = _CHECKPOINTS_DIR / run_name
     out.mkdir(parents=True, exist_ok=True)
+    best_loss = float("inf")
 
     estimator = TabPFNRegressor(
         fit_mode="batched",
@@ -157,22 +138,26 @@ def finetune(
 
     for epoch in range(n_epochs):
         train, test = data_provider(n_surfaces_per_epoch)
-        n_context = len(train[0][0])
 
-        dataloader = _build_dataloader(estimator, train, test, n_context, seed=seed + epoch, rng=rng)
+        batches = build_regression_batches(estimator, train, test, rng)
+        rng.shuffle(batches)
         train_loss = _run_batches(
-            estimator, dataloader, perf_opts, device,
+            estimator, batches, perf_opts, device,
             optimizer=optimizer, scheduler=scheduler, grad_clip=grad_clip,
         )
 
         if val_train is not None:
-            val_dataloader = _build_dataloader(estimator, val_train, val_test, n_context, seed=seed, rng=rng)
-            val_loss = _run_batches(estimator, val_dataloader, perf_opts, device)
+            val_batches = build_regression_batches(estimator, val_train, val_test, rng)
+            val_loss = _run_batches(estimator, val_batches, perf_opts, device)
             log.info("Epoch %d/%d | train_loss=%.4f val_loss=%.4f", epoch + 1, n_epochs, train_loss, val_loss)
         else:
+            val_loss = train_loss
             log.info("Epoch %d/%d | train_loss=%.4f", epoch + 1, n_epochs, train_loss)
 
-        torch.save(estimator.model_.state_dict(), out / f"epoch_{epoch + 1:03d}.pt")
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(estimator.model_.state_dict(), out / "best.pt")
+            log.info("Saved new best checkpoint (loss=%.4f) to %s/best.pt", best_loss, out)
 
     torch.save(estimator.model_.state_dict(), out / "final.pt")
     log.info("Saved final model to %s/final.pt", out)
@@ -186,4 +171,4 @@ if __name__ == "__main__":
 
     cfg = yaml.safe_load(open("config.yaml"))
     data_provider = partial(data_preparation, cfg, n_context=10)
-    finetune(data_provider, n_epochs=1, n_surfaces_per_epoch=2, n_val_surfaces=2)
+    finetune(data_provider, "smoke_test", n_epochs=1, n_surfaces_per_epoch=2, n_val_surfaces=2)
