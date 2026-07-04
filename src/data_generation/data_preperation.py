@@ -19,9 +19,14 @@ def sample_sparse_points(ks, ttms, n_points, n_samples):
     return k_idx, t_idx
 
 
-def generate_surfaces(cfg, n):
+def grid_from_cfg(cfg):
     ttms = np.geomspace(cfg["ttm"]["min"], cfg["ttm"]["max"], cfg["ttm"]["n_points"])
     ks = np.linspace(cfg["k"]["min"], cfg["k"]["max"], cfg["k"]["n_points"])
+    return ttms, ks
+
+
+def generate_surfaces(cfg, n):
+    ttms, ks = grid_from_cfg(cfg)
 
     rho, eta, gamma, v_bar, v0, kappa = sample_params(cfg, n)
     surfaces = ssvi(ttms, ks, rho, eta, gamma, v_bar, v0, kappa) 
@@ -43,7 +48,8 @@ def data_preparation(cfg, n, n_context):
     for i in range(n):
         sigma = surfaces[i].ravel()
 
-        test_idx = np.setdiff1d(np.arange(len(sigma)), train_idx[i])
+        # full grid, including context points
+        test_idx = np.arange(len(sigma))
 
         X_train, y_train = np.column_stack([k_flat[train_idx[i]], tau_flat[train_idx[i]]]), sigma[train_idx[i]]
         X_test,  y_test  = np.column_stack([k_flat[test_idx],tau_flat[test_idx]]), sigma[test_idx]
