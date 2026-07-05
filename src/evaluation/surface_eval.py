@@ -18,7 +18,26 @@ def check_arbitrage(iv, ttms, ks, tol=-1e-10):
 
 
 def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
-    """check_arbitrage for a flat, ttm-major raveled IV array over cfg's (ttm, k) grid."""
     ttms, ks = grid_from_cfg(cfg)
     iv = iv_flat.reshape(len(ttms), len(ks))
     return check_arbitrage(iv, ttms, ks, tol=tol)
+
+
+def eval_surfaces(model, train_list, test_list, cfg, reload_state=None):
+    maes, mapes, cal_violations, butterfly_violations = [], [], [], []
+    for (X_tr, y_tr), (X_te, y_te) in zip(train_list, test_list):
+        model.fit(X_tr, y_tr) # always resets weights (but is still needed to preprocess data)
+        if reload_state is not None:
+            model.model_.load_state_dict(reload_state)  # restore weights if finetuned
+        y_pred = model.predict(X_te)
+
+        maes.append(np.mean(np.abs(y_te - y_pred)))
+        mapes.append(np.mean(np.abs((y_te - y_pred) / y_te)) * 100)
+
+        cal_v, butterfly_v = check_arbitrage_flat(cfg, y_pred)
+        cal_violations.append(cal_v)
+        butterfly_violations.append(butterfly_v)
+
+    return tuple(np.mean(x) for x in (maes, mapes, cal_violations, butterfly_violations))
+
+
