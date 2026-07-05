@@ -1,6 +1,7 @@
 *.pdf
 .DS_Store
 *.pt
+checkpoints/
 
 # Python-generated files
 __pycache__/
