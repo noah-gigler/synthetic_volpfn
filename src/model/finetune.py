@@ -115,7 +115,11 @@ def finetune(
     seed: int = 0,
 ) -> TabPFNRegressor:
     out = _CHECKPOINTS_DIR / run_name
-    out.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        raise FileExistsError(
+            f"Checkpoint dir {out} already exists. Delete old run or pick a new name."
+        )
+    out.mkdir(parents=True)
     best_loss = float("inf")
 
     estimator = TabPFNRegressor(
