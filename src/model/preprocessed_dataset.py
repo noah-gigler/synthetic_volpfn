@@ -1,5 +1,5 @@
-# Builds TabPFN RegressorBatches from already-split context/query arrays
-# skipping tabpfn.finetuning.data_util's generic split_fn/chunking machinery since we don't need it. 
+# Preprocesses already-split (context, query) surfaces into TabPFN RegressorBatch containers,
+# skipping tabpfn.finetuning.data_util's generic split_fn/chunking machinery since we don't need it.
 # Preprocessing-config selection is based on context size alone
 
 import numpy as np
@@ -11,7 +11,7 @@ from tabpfn.preprocessing.datamodel import FeatureModality
 from tabpfn.preprocessing.ensemble import TabPFNEnsemblePreprocessor
 
 
-def build_regression_batches(estimator, train, test, rng: np.random.Generator) -> list[RegressorBatch]:
+def preprocess_surfaces(estimator, train, test, rng: np.random.Generator) -> list[RegressorBatch]:
     """One RegressorBatch per (context, query) surface, each with its own context size.
 
     `train`/`test` are the lists returned by a `data_provider`, i.e.
@@ -20,7 +20,7 @@ def build_regression_batches(estimator, train, test, rng: np.random.Generator) -
     if not hasattr(estimator, "models_") or estimator.models_ is None:
         estimator._initialize_model_variables()
 
-    batches = []
+    surfaces = []
     for (X_context, y_context), (X_query_raw, y_query_raw) in zip(train, test):
         ensemble_configs, X_context, y_context, znorm_bardist = estimator._initialize_dataset_preprocessing(
             X=X_context, y=y_context, random_state=rng,
@@ -43,7 +43,7 @@ def build_regression_batches(estimator, train, test, rng: np.random.Generator) -
         def batched(x, dtype=torch.float32):
             return torch.as_tensor(x, dtype=dtype).unsqueeze(0)
 
-        batches.append(
+        surfaces.append(
             RegressorBatch(
                 X_context=[batched(m.X_train) for m in members],
                 X_query=[batched(m.transform_X_test(X_query_raw)) for m in members],
@@ -58,4 +58,4 @@ def build_regression_batches(estimator, train, test, rng: np.random.Generator) -
             )
         )
 
-    return batches
+    return surfaces

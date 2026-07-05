@@ -29,9 +29,10 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   `sample_sparse_points` draws a Gaussian ATM-weighted, uniform-in-ttm subset of grid indices as the
   "sparse quotes" context; `data_preparation` builds the corresponding train/test `(X=[k,tau], y=iv)` arrays
   per surface. Has a `__main__` smoke test that fits/predicts a single surface with vanilla `TabPFNRegressor`.
-- **`src/model/preprocessed_dataset.py`** — `build_regression_batches(estimator, train, test, rng)` turns a
+- **`src/model/preprocessed_dataset.py`** — `preprocess_surfaces(estimator, train, test, rng)` turns a
   `data_provider`'s pre-split `(context, query)` arrays into a list of TabPFN `RegressorBatch`es, one per
-  surface. Deliberately *not* using TabPFN's own `tabpfn.finetuning.data_util.get_preprocessed_dataset_chunks`:
+  surface (naming note: "batch" is reserved for the `batch_size` gradient-accumulation notion in
+  `finetune.py`; a `RegressorBatch` here always holds a single surface). Deliberately *not* using TabPFN's own `tabpfn.finetuning.data_util.get_preprocessed_dataset_chunks`:
   that helper assumes one raw dataset that still needs a generic `split_fn`-based train/test split (plus lazy
   chunking for oversized datasets), neither of which applies here since context/query are already split and
   small. Preprocessing-config selection (`_initialize_dataset_preprocessing`, i.e. which pipelines/target
@@ -42,11 +43,13 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   epoch can have different context sizes; nothing here assumes a fixed `n_context`.
 - **`src/model/finetune.py`** — the actual meta-learning finetuning loop, data-agnostic: it takes a
   `data_provider(n) -> (train, test)` callable (bind dataset-specific config, e.g. `cfg`/`n_context`, via
-  `functools.partial` before passing it in) instead of knowing about SSVI or sampling itself. Each epoch builds
-  batches via `build_regression_batches`, caches each one's context into the TabPFN executor with no gradient
-  (`fit_from_preprocessed(..., no_refit=True)`), then does a differentiable forward pass on the query points
-  to get bar-distribution logits and backprops a regression loss (`_compute_regression_loss`) against the
-  model's own bar-distribution buckets. `run_name` is a required positional arg (no default) — checkpoints
+  `functools.partial` before passing it in) instead of knowing about SSVI or sampling itself. Each epoch
+  preprocesses fresh surfaces via `preprocess_surfaces`, caches each one's context into the TabPFN executor
+  with no gradient (`fit_from_preprocessed(..., no_refit=True)`), then does a differentiable forward pass on
+  the query points to get bar-distribution logits and backprops a regression loss (`_compute_regression_loss`)
+  against the model's own bar-distribution buckets. `batch_size` is an *effective* batch size implemented as
+  gradient accumulation (surfaces run sequentially, gradients averaged per optimizer step) — true batched
+  forward passes aren't possible because surfaces have ragged context sizes. `run_name` is a required positional arg (no default) — checkpoints
   always save to `<repo_root>/checkpoints/<run_name>/`, resolved from `finetune.py`'s own file location so it's
   correct regardless of caller cwd (e.g. a notebook running with cwd=`notebooks/`). Only `best.pt` (lowest val
   loss so far, or train loss if `n_val_surfaces=0`) and `final.pt` are saved — no per-epoch checkpoints, since
