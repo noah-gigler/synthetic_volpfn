@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=1.26.4",
     "pandas>=2.3.3",
     "pyyaml>=6.0.3",
+    "scipy>=1.13.0",
     "tabpfn>=8.0.2",
     "vollib>=1.0.7",
 ]
