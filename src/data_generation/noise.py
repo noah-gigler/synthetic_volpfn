@@ -1,14 +1,4 @@
-# Bid-ask quote noise for synthetic surfaces, plus the noisy (bid/ask) data providers.
-#
-# Layered spread model, deliberately not recoverable from (k, tau) alone:
-#   vega-based structural half-spread  x  per-surface regime  x  per-quote jitter,
-# with the true IV at a uniform random position inside the quoted spread, so the
-# spread is asymmetric around the truth and no mid is ever observed.
-#
-# Noisy input schema: X = [k, tau, side] with side -1 = bid, +1 = ask, 0 = true.
-# Each sampled quote location contributes two context rows (bid and ask); query rows
-# are the full grid with side = 0 and clean targets. side = 0 sits between the two
-# labeled values so plain interpolation already biases toward "inside the spread".
+# X = [k, tau, side], side in {-1: bid, +1: ask, 0: true}
 
 import numpy as np
 from scipy.stats import norm
@@ -23,7 +13,7 @@ BID, ASK, TRUE = -1.0, 1.0, 0.0
 
 
 def _bs_otm_price_vega(k, tau, sigma):
-    """Black-Scholes OTM option price and vega per unit forward (F=1, r=0)."""
+    # OTM option price and vega per unit forward (F=1, r=0)
     sqrt_tau = np.sqrt(tau)
     d1 = -k / (sigma * sqrt_tau) + sigma * sqrt_tau / 2
     d2 = d1 - sigma * sqrt_tau
@@ -34,10 +24,6 @@ def _bs_otm_price_vega(k, tau, sigma):
 
 
 def half_spread(k, tau, sigma, noise_cfg, regime=1.0):
-    """IV half-spread: price half-spread (tick + beta*price, the standard fixed +
-    proportional cost decomposition) scaled by the regime, converted to IV units via
-    vega, per-quote lognormal jitter, capped (liquidity filter proxy - nobody quotes
-    8-sigma wings tighter than the cap). The tick term is what widens the wings."""
     price, vega = _bs_otm_price_vega(k, tau, sigma)
     s_price = regime * (noise_cfg["tick"] + noise_cfg["beta"] * price)
     s = s_price / np.maximum(vega, 1e-300)
@@ -46,8 +32,7 @@ def half_spread(k, tau, sigma, noise_cfg, regime=1.0):
 
 
 def add_quote_noise(k, tau, sigma_true, noise_cfg, regime=1.0):
-    """True IV sits at a uniform random position inside the quoted spread.
-    Returns (bid, ask); regime=0 collapses to bid = ask = true."""
+    # true IV at a uniform random position inside the spread; regime=0 -> bid=ask=true
     s = half_spread(k, tau, sigma_true, noise_cfg, regime)
     u = np.random.uniform(0, 1, np.shape(sigma_true))
     bid = np.maximum(sigma_true - u * 2 * s, 1e-4)
@@ -56,7 +41,6 @@ def add_quote_noise(k, tau, sigma_true, noise_cfg, regime=1.0):
 
 
 def _noisy_split(ks, ttms, surfaces, k_idx, t_idx, regimes, noise_cfg):
-    """Build (train, test) with bid/ask context rows and clean full-grid query."""
     TT, KK = np.meshgrid(ttms, ks, indexing="ij")
     k_flat, tau_flat = KK.ravel(), TT.ravel()
 
@@ -68,7 +52,6 @@ def _noisy_split(ks, ttms, surfaces, k_idx, t_idx, regimes, noise_cfg):
 
         bid, ask = add_quote_noise(kq, tauq, sigma[idx], noise_cfg, regimes[i])
 
-        # two rows per quote: first all bids, then all asks (same (k, tau) order)
         X_train = np.column_stack([
             np.tile(kq, 2), np.tile(tauq, 2), np.repeat([BID, ASK], len(kq)),
         ])
@@ -89,10 +72,7 @@ def _sample_regimes(noise_cfg, n, regime):
 
 
 def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None):
-    """Bid/ask counterpart of data_preparation; same (train, test) contract, so it plugs
-    into finetune() via functools.partial. `n_context` counts quote locations (a context
-    holds 2*n_context rows). `regime=None` samples a lognormal noise regime per surface;
-    a scalar fixes it for all surfaces (0 -> noiseless quotes)."""
+    # n_context counts quote locations (context holds 2*n_context rows)
     noise_cfg = cfg["noise"]
     ttms, ks, surfaces = generate_surfaces(cfg, n)
     sizes = sample_context_sizes(n_context, n, dist=size_dist)
@@ -102,9 +82,7 @@ def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None):
 
 
 def make_noisy_stratified_eval_set(cfg, n_surfaces, context_sizes, regime=None):
-    """Mirror of make_stratified_eval_set for the bid/ask schema: the *same* n_surfaces
-    surfaces (and per-surface noise regimes) at every size in `context_sizes`, size-major.
-    Noise is drawn once at construction, so the eval task is frozen."""
+    # same n_surfaces at every size in context_sizes, size-major; noise drawn once (frozen)
     noise_cfg = cfg["noise"]
     ttms, ks, surfaces = generate_surfaces(cfg, n_surfaces)
     regimes = _sample_regimes(noise_cfg, n_surfaces, regime)

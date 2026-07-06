@@ -38,11 +38,6 @@ def _init_params(cfg, n_restarts):
 
 
 def fit_ssvi(X, y, cfg, n_restarts=3, weights=None):
-    """X is (n, 2) columns [k, tau], y is implied vol. Returns (params, cost).
-
-    `weights` (optional, per point) scale the total-variance residuals - for noisy
-    quotes with IV noise sd s_i use weights 1/(2*y_i*tau_i*s_i) (delta method:
-    dw = 2*sigma*tau*dsigma)."""
     k, ttm = X[:, 0], X[:, 1]
     y_w = y**2 * ttm  # fit in total-variance space
 

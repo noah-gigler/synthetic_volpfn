@@ -8,6 +8,13 @@ Masters semester project studying whether TabPFN (a tabular foundation model) ca
 interpolate/extrapolate implied volatility surfaces from a sparse set of quoted points, using synthetic
 SSVI-generated surfaces as training data (see `VolSmoothing_with_TabPFN_proposal.pdf`).
 
+## Code style
+
+- No docstrings. No comments restating what the code obviously does.
+- A `#` comment is only for the non-obvious: a formula/theorem reference, a units/shape
+  note, a gotcha (e.g. `regime=0 -> bid=ask=true`). If it wouldn't confuse a reader,
+  don't write it. Match `src/data_generation/SSVI.py`'s density, not `data_preperation.py`'s.
+
 ## Commands
 
 - Environment is managed with `uv` (Python 3.12 pinned via `.python-version`); dependencies in `pyproject.toml` / `uv.lock`.
