@@ -28,7 +28,24 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
 - **`src/data_generation/data_preperation.py`** — turns full surfaces into (context, query) point sets:
   `sample_sparse_points` draws a Gaussian ATM-weighted, uniform-in-ttm subset of grid indices as the
   "sparse quotes" context; `data_preparation` builds the corresponding train/test `(X=[k,tau], y=iv)` arrays
-  per surface. Has a `__main__` smoke test that fits/predicts a single surface with vanilla `TabPFNRegressor`.
+  per surface. `n_context` may be an int or a `(lo, hi)` tuple — `sample_context_sizes` then draws a
+  per-surface size (uniform by default, `dist="log"` for log-uniform). `make_stratified_eval_set`
+  presents the *same* surfaces at several fixed context sizes (size-major) for stable validation.
+  Has a `__main__` smoke test that fits/predicts a single surface with vanilla `TabPFNRegressor`.
+- **`src/data_generation/noise.py`** — bid-ask quote noise and the noisy data providers
+  (`noisy_data_preparation`, `make_noisy_stratified_eval_set`), mirroring `data_preperation.py`'s
+  contracts so they plug into `finetune()` unchanged. Layered spread model (vega-based structural
+  half-spread from `tick + beta*price`, per-surface lognormal regime, per-quote lognormal jitter,
+  cap), deliberately not recoverable from `(k, tau)` alone; the true IV sits at a uniform random
+  position inside the quoted spread (asymmetric — no mid is ever observed). Noisy schema:
+  `X = [k, tau, side]` with side −1=bid/+1=ask/0=true; each quote location contributes two context
+  rows, query rows are the full grid with side=0 and clean targets, and `n_context` counts quote
+  *locations* (a context holds `2*n_context` rows — `finetune`'s val-breakdown labels show rows).
+  Noise parameters live in `config.yaml` under `noise:`.
+- **`src/model/SSVI.py`** — least-squares SSVI refit baseline (`fit_ssvi`, prior-median +
+  prior-sampled restarts, fit in total-variance space; optional per-point `weights` for noisy
+  quotes: `1/(2*y*tau*s)` with half-spread `s`), plus `predict_ssvi`. On clean quotes this recovers
+  surfaces exactly at ≥6 points (parameter count) — it is the oracle baseline there.
 - **`src/model/preprocessed_dataset.py`** — `preprocess_surfaces(estimator, train, test, rng)` turns a
   `data_provider`'s pre-split `(context, query)` arrays into a list of TabPFN `RegressorBatch`es, one per
   surface (naming note: "batch" is reserved for the `batch_size` gradient-accumulation notion in
@@ -49,7 +66,12 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   the query points to get bar-distribution logits and backprops a regression loss (`_compute_regression_loss`)
   against the model's own bar-distribution buckets. `batch_size` is an *effective* batch size implemented as
   gradient accumulation (surfaces run sequentially, gradients averaged per optimizer step) — true batched
-  forward passes aren't possible because surfaces have ragged context sizes. `run_name` is a required positional arg (no default) — checkpoints
+  forward passes aren't possible because surfaces have ragged context sizes. Validation: pass a prebuilt
+  `val_data=(train, test)` (e.g. from a stratified eval-set helper) and `val_every=k`; val surfaces are
+  preprocessed **once** up front (rebuilding would re-consume RNG and drift the val task), the log prints a
+  per-context-size loss breakdown (labels = context *rows*), and `best.pt` only updates on val epochs. With
+  fresh surfaces each epoch there is no dataset to overfit — prefer `final.pt` (gets the full cosine anneal);
+  `best.pt` selection is dominated by the smallest-context losses. `run_name` is a required positional arg (no default) — checkpoints
   always save to `<repo_root>/checkpoints/<run_name>/`, resolved from `finetune.py`'s own file location so it's
   correct regardless of caller cwd (e.g. a notebook running with cwd=`notebooks/`). Only `best.pt` (lowest val
   loss so far, or train loss if `n_val_surfaces=0`) and `final.pt` are saved — no per-epoch checkpoints, since
@@ -69,10 +91,28 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   fully diagnosed; if raising `n_estimators` again, re-verify training stability first (e.g. check
   `torch.isfinite(loss)` every batch before backprop).
 - **`src/evaluation/surface_eval.py`** — `check_arbitrage` checks a predicted/generated surface for
-  calendar-spread and butterfly arbitrage violations in total-variance space (`w = iv^2 * ttm`).
+  calendar-spread and butterfly arbitrage violations in total-variance space (`w = iv^2 * ttm`);
+  `eval_surfaces` (MAE/MAPE/arb rates; schema-agnostic, uses the fit-then-`reload_state` pattern for
+  finetuned checkpoints), `quantile_coverage` (empirical coverage of central predictive intervals via
+  TabPFN quantile output) and `inside_spread_fraction` (predictions within [bid, ask] at quote locations;
+  note the synthetic truth *always* lies inside the spread by construction, so ~100% is expected of a good
+  model — the metric only flags pathologies, it cannot distinguish denoising from mid-interpolation).
+- **Evaluate in a fresh kernel/process — known stale-kernel artifact.** Long-lived Jupyter kernels have
+  twice produced corrupted eval results at specific (model, context-size) slots: 10-50x worse MAE,
+  deterministic within the session (same slots across independent data draws), different slots each
+  session, affecting even the vanilla non-finetuned baseline, and never reproducible in a fresh process.
+  A controlled ordering experiment (same slot evaluated before vs after a sweep-like history in one fresh
+  process) showed no effect, ruling out a simple shape-keyed cache; root cause unknown. Mitigation:
+  restart the kernel before eval cells, or run sweep slots in subprocesses; distrust any in-kernel number
+  that contradicts training-val values. The finetune-style path (`fit_from_preprocessed` + `forward`) has
+  been immune throughout.
 - **`notebooks/`** — exploratory work: `tabpfn_test.ipynb` (baseline, non-finetuned TabPFN on SSVI surfaces),
-  `tabpfn_finetuning.ipynb` (drives/inspects the finetuning loop), `ssvi_validation.ipynb` (sanity-checks
-  the SSVI generator/arbitrage conditions).
+  `tabpfn_finetuning.ipynb` (drives/inspects the clean finetuning loop), `tabpfn_noisy_finetuning.ipynb`
+  (bid/ask-noise experiment: run cell + sweep/coverage/inside-spread/visual eval), `ssvi_validation.ipynb`
+  (sanity-checks the SSVI generator/arbitrage conditions).
+- **`notes/results_summary.md`** — running summary of all finetuning experiments and established
+  findings (run-by-run outcomes, refit identifiability, the noisy-quote headline results, calibration,
+  known issues, open items). Read this before designing a new run or re-deriving conclusions.
 - **`notes/tabpfn_preprocessing_ablation.md`** — findings on which TabPFN preprocessing steps matter for
   this `(k, tau) -> IV` task: squashing-scaler and SVD features are load-bearing and must be kept; the
   fingerprint feature is dead weight for this dense, non-duplicated grid and is disabled
