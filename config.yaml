@@ -22,6 +22,16 @@ gamma:
   sigma: 0.5
 
 
+# quote noise (bid/ask spread model, see src/data_generation/noise.py)
+# --------------------------------------------------------------------------
+noise:
+  beta: 0.015         # proportional price half-spread component
+  tick: 3.0e-4        # fixed price half-spread component per unit forward (widens wings)
+  cap: 0.05           # max IV half-spread (5 vol pts) - liquidity-filter proxy
+  regime_sigma: 0.5   # per-surface lognormal scale on the spread (calm vs stressed)
+  jitter_sigma: 0.3   # per-quote lognormal jitter on the half-spread
+
+
 # grid settings
 # --------------------------------------------------------------------------
 k:
