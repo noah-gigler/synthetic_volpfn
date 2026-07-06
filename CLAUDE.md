@@ -15,6 +15,13 @@ SSVI-generated surfaces as training data (see `VolSmoothing_with_TabPFN_proposal
   note, a gotcha (e.g. `regime=0 -> bid=ask=true`). If it wouldn't confuse a reader,
   don't write it. Match `src/data_generation/SSVI.py`'s density, not `data_preperation.py`'s.
 
+## Code style
+
+- No docstrings. No comments restating what the code obviously does.
+- A `#` comment is only for the non-obvious: a formula/theorem reference, a units/shape
+  note, a gotcha (e.g. `regime=0 -> bid=ask=true`). If it wouldn't confuse a reader,
+  don't write it. Match `src/data_generation/SSVI.py`'s density, not `data_preperation.py`'s.
+
 ## Commands
 
 - Environment is managed with `uv` (Python 3.12 pinned via `.python-version`); dependencies in `pyproject.toml` / `uv.lock`.
@@ -48,7 +55,12 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   `X = [k, tau, side]` with side −1=bid/+1=ask/0=true; each quote location contributes two context
   rows, query rows are the full grid with side=0 and clean targets, and `n_context` counts quote
   *locations* (a context holds `2*n_context` rows — `finetune`'s val-breakdown labels show rows).
-  Noise parameters live in `config.yaml` under `noise:`.
+  Noise parameters live in `config.yaml` under `noise:`. Also hosts the truth-free providers for
+  the quote loss: `quote_data_preparation` (context = bid/ask rows; query = full grid with
+  `y_query` an `(n_grid, 2)` array of `[bid, ask]` interval targets at *held-out* quote locations,
+  NaN elsewhere — true prices appear nowhere; the affine z-norm in `preprocess_surfaces` transforms
+  interval bounds correctly with no special handling) and `make_quote_eval_set` (frozen proxy-loss
+  val set, so checkpoint selection stays truth-free too).
 - **`src/model/SSVI.py`** — least-squares SSVI refit baseline (`fit_ssvi`, prior-median +
   prior-sampled restarts, fit in total-variance space; optional per-point `weights` for noisy
   quotes: `1/(2*y*tau*s)` with half-spread `s`), plus `predict_ssvi`. On clean quotes this recovers
@@ -65,6 +77,14 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   quotes are ever available, never a full grid) — this differs from the old finetuning-helper pattern, which
   selected configs based on train+test combined, and is a deliberate choice, not an oversight. Surfaces in one
   epoch can have different context sizes; nothing here assumes a fixed `n_context`.
+- **`src/model/quote_loss.py`** — the truth-free training loss ("quote loss"): interval-censored
+  NLL `-log P(bid ≤ y ≤ ask)` via the bar distribution's differentiable `cdf` at held-out quote rows
+  (NaN rows masked — but filled with a dummy value first, `cdf` asserts on NaN), plus calendar and
+  butterfly hinge penalties on the raw-space pointwise mean over the full grid (Durrleman-g, same
+  formulas as `check_arbitrage`). Assumes query = full ttm-major grid. Plugs into `finetune()` via
+  the `loss_fn` hook; bind `grid_shape`/`lambda_cal`/`lambda_bf` with `functools.partial`. Headline
+  result (see `notes/results_summary.md`): at N=20 quotes this matches the fully supervised model's
+  truth-MAE without ever training on a true price, with 0% arb violations.
 - **`src/model/finetune.py`** — the actual meta-learning finetuning loop, data-agnostic: it takes a
   `data_provider(n) -> (train, test)` callable (bind dataset-specific config, e.g. `cfg`/`n_context`, via
   `functools.partial` before passing it in) instead of knowing about SSVI or sampling itself. Each epoch
@@ -78,7 +98,9 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   preprocessed **once** up front (rebuilding would re-consume RNG and drift the val task), the log prints a
   per-context-size loss breakdown (labels = context *rows*), and `best.pt` only updates on val epochs. With
   fresh surfaces each epoch there is no dataset to overfit — prefer `final.pt` (gets the full cosine anneal);
-  `best.pt` selection is dominated by the smallest-context losses. `run_name` is a required positional arg (no default) — checkpoints
+  `best.pt` selection is dominated by the smallest-context losses. An optional
+  `loss_fn(estimator, surface_batch, logits_BQL)` replaces the default CRPS+MSE loss for both train
+  and val passes (used by the quote loss); `loss_fn=None` keeps the default path byte-identical. `run_name` is a required positional arg (no default) — checkpoints
   always save to `<repo_root>/checkpoints/<run_name>/`, resolved from `finetune.py`'s own file location so it's
   correct regardless of caller cwd (e.g. a notebook running with cwd=`notebooks/`). Only `best.pt` (lowest val
   loss so far, or train loss if `n_val_surfaces=0`) and `final.pt` are saved — no per-epoch checkpoints, since
@@ -115,8 +137,10 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   been immune throughout.
 - **`notebooks/`** — exploratory work: `tabpfn_test.ipynb` (baseline, non-finetuned TabPFN on SSVI surfaces),
   `tabpfn_finetuning.ipynb` (drives/inspects the clean finetuning loop), `tabpfn_noisy_finetuning.ipynb`
-  (bid/ask-noise experiment: run cell + sweep/coverage/inside-spread/visual eval), `ssvi_validation.ipynb`
-  (sanity-checks the SSVI generator/arbitrage conditions).
+  (bid/ask-noise experiment: run cell + sweep/coverage/inside-spread/visual eval),
+  `tabpfn_quote_finetuning.ipynb` (quote-loss experiment — truth-free training; offline truth eval is
+  reporting only, never checkpoint selection), `ssvi_validation.ipynb` (sanity-checks the SSVI
+  generator/arbitrage conditions).
 - **`notes/results_summary.md`** — running summary of all finetuning experiments and established
   findings (run-by-run outcomes, refit identifiability, the noisy-quote headline results, calibration,
   known issues, open items). Read this before designing a new run or re-deriving conclusions.

@@ -34,11 +34,10 @@ _CHECKPOINTS_DIR = Path(__file__).resolve().parents[2] / "checkpoints"
 
 
 def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, scheduler=None,
-              grad_clip=None, batch_size=1):
-    """One pass over `surfaces`. Trains if `optimizer` is given, accumulating gradients
-    over `batch_size` surfaces per optimizer step (so one degenerate surface can't
-    yank the weights alone); otherwise runs a no-grad validation pass.
-    Returns per-surface losses in input order."""
+              grad_clip=None, batch_size=1, loss_fn=None):
+    # train pass if optimizer is given (gradient accumulation over batch_size surfaces),
+    # else no-grad val pass; loss_fn(estimator, surface, logits_BQL) overrides CRPS+MSE.
+    # returns per-surface losses in input order
     training = optimizer is not None
     estimator.model_.train(training)
 
@@ -72,16 +71,19 @@ def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, schedul
             logits_QBEL = torch.stack(per_estim_logits, dim=2)
             Q, B, E, L = logits_QBEL.shape
             logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
-            targets_BQ = surface.y_query.repeat(B * E, 1).to(device)
 
-            loss = _compute_regression_loss(
-                logits_BQL=logits_BQL,
-                targets_BQ=targets_BQ,
-                bardist_loss_fn=bardist_loss_fn,
-                ce_loss_weight=0.0,
-                crps_loss_weight=1.0,
-                mse_loss_weight=1.0,
-            )
+            if loss_fn is not None:
+                loss = loss_fn(estimator, surface, logits_BQL)
+            else:
+                targets_BQ = surface.y_query.repeat(B * E, 1).to(device)
+                loss = _compute_regression_loss(
+                    logits_BQL=logits_BQL,
+                    targets_BQ=targets_BQ,
+                    bardist_loss_fn=bardist_loss_fn,
+                    ce_loss_weight=0.0,
+                    crps_loss_weight=1.0,
+                    mse_loss_weight=1.0,
+                )
 
             if training:
                 (loss / group_size).backward()
@@ -107,6 +109,7 @@ def finetune(
     n_val_surfaces: int = 5,
     val_data: tuple[list, list] | None = None,
     val_every: int = 1,
+    loss_fn=None,
     lr: float = 1e-5,
     weight_decay: float = 0.01,
     grad_clip: float = 1.0,
@@ -142,11 +145,7 @@ def finetune(
     schedule_fn = get_cosine_schedule_with_warmup(total_steps=total_steps, warmup_steps=warmup_steps)
     scheduler = LambdaLR(optimizer, lr_lambda=schedule_fn)
 
-    # fixed held-out (context, query) sets to track validation loss across epochs;
-    # `val_data` (e.g. from make_stratified_eval_set) takes precedence over drawing
-    # random surfaces from the data_provider. Val surfaces are preprocessed once:
-    # redoing it each epoch would re-run preprocessing and re-consume RNG, so the
-    # val task itself would drift between epochs.
+    # frozen val set: preprocessed once (rebuilding would re-consume RNG and drift the val task)
     if val_data is not None:
         val_train, val_test = val_data
     elif n_val_surfaces > 0:
@@ -172,13 +171,13 @@ def finetune(
         train_losses = _run_pass(
             estimator, surfaces, perf_opts, device,
             optimizer=optimizer, scheduler=scheduler, grad_clip=grad_clip,
-            batch_size=batch_size,
+            batch_size=batch_size, loss_fn=loss_fn,
         )
         train_loss = float(np.mean(train_losses))
 
         is_val_epoch = val_surfaces is not None and ((epoch + 1) % val_every == 0 or epoch == n_epochs - 1)
         if is_val_epoch:
-            val_losses = _run_pass(estimator, val_surfaces, perf_opts, device)
+            val_losses = _run_pass(estimator, val_surfaces, perf_opts, device, loss_fn=loss_fn)
             val_loss = float(np.mean(val_losses))
 
             by_size: dict[int, list[float]] = {}

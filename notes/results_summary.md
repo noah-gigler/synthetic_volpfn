@@ -1,4 +1,4 @@
-# Results summary (as of 2026-07-06)
+# Results summary (as of 2026-07-07)
 
 Chronology of finetuning experiments and what each established. Checkpoints in `checkpoints/<run>/`;
 all evals on synthetic SSVI surfaces from the `config.yaml` prior, MAE vs the clean truth on the
@@ -12,6 +12,7 @@ full 15x25 grid unless stated otherwise.
 | `ssvi_dynamic_context_3_30` | log-uniform 3-30 | 2k steps, batch 1 | big small-n gains, regressed at n>=15 (over-weighted sparse regime; very spiky training) |
 | `ssvi_uniform_context_3_30` (formerly `..._accum4_long`) | uniform 3-30 | 15k steps, batch 4 | dominates everywhere clean: beats fixed-20 at n=20 (MAE 0.0010 vs 0.0018-ish) while best at small n |
 | `ssvi_noisy_uniform_3_60` | bid/ask schema, uniform 3-60 quotes | 15k steps, batch 4 | the noisy-quote model; see below |
+| `ssvi_quote_n20` / `ssvi_quote_n20_long` | bid/ask, fixed 20 quotes, **quote loss (no true prices)** | 500 / 15k steps, batch 4 | headline: truth-free parity with supervision; see below |
 
 ## Established findings
 
@@ -47,6 +48,38 @@ full 15x25 grid unless stated otherwise.
    by construction, so this metric only flags pathologies; it cannot distinguish denoising from
    mid-interpolation. Use the visual slice plots for that.
 
+9. **HEADLINE — quote loss: supervised-quality surfaces without ever observing a true price.**
+   Training loss (`src/model/quote_loss.py`): interval-censored NLL `-log P(bid <= y <= ask)`
+   (bar-distribution CDF difference) at 15 *held-out* quote locations per surface + calendar/
+   butterfly hinges on the raw-space pointwise mean over the full grid (the substitute for the
+   arb-free-truth signal supervised training gets implicitly). Provider
+   (`quote_data_preparation` in `noise.py`): context = bid/ask rows at 20 quotes, query = full
+   grid, y_query = [bid, ask] at held-out locations / NaN elsewhere - truth appears nowhere,
+   including checkpoint selection (val = same proxy loss on frozen surfaces).
+   After 15k steps (`ssvi_quote_n20_long`, lambda_cal = lambda_bf = 1.0), MAE vs hidden truth
+   at N=20 quotes, 25 test surfaces:
+
+   | m | quote FT | supervised (`ssvi_noisy_uniform_3_60`) | refit WLS | baseline (mids) | mid noise floor |
+   |---|---|---|---|---|---|
+   | 0.5 | 0.0027 | 0.0025 | 0.0020 | 0.0120 | 0.0061 |
+   | 1.0 | 0.0031 | 0.0031 | 0.0030 | 0.0146 | 0.0079 |
+   | 2.0 | 0.0048 | 0.0051 | 0.0063 | 0.0160 | 0.0119 |
+
+   Reading: parity with the fully supervised model at every noise level (nominally ahead at
+   m=2), ties WLS at m=1 and beats it at m=2, ~2.5x below the raw mid noise floor, and **0%
+   calendar/butterfly violations at all regimes** (the short 500-step run still had 12%/4% at
+   m=0.5 - fixed by training budget alone, no lambda retuning). The supervised comparison is
+   fair-to-conservative: the multi-size supervised model beat the fixed-20 specialist at n=20
+   in the clean experiments, so the ceiling is the strongest available.
+   Implication: the truth label is nearly redundant given quotes + no-arb + the learned prior,
+   at this context size and noise model. Since the quote loss needs only observable data, the
+   same training loop runs on real market quotes unchanged (data-provider swap) - the sim-to-real
+   plan is now "pretrain on synthetic, calibrate on real quotes", with no simulator-fidelity cap.
+   Notes: interval NLL has a nonzero floor (truth's position inside the spread is irreducibly
+   uncertain), so train/val plateau at a positive value at convergence; per-surface loss scale
+   varies with the noise regime (tight intervals = harder), which makes train_loss look noisier
+   than the optimization actually is.
+
 ## Known issue
 
 **Stale-kernel eval artifact**: long-lived Jupyter kernels produced 10-50x-worse MAE at specific
@@ -59,10 +92,16 @@ contradict training-val values.
 
 ## Open items
 
+- Variable-context quote-loss run (uniform 3-60), mirroring the supervised setup - capability
+  extension after the N=20 result; also the natural head-to-head at all sizes.
+- Real-data calibration: swap `quote_data_preparation` for a real-quote provider (chain ->
+  context/held-out split); pretrain synthetic, finetune with the quote loss on market data.
 - Correlated quote noise (v2): current noise is independent per quote - the easiest kind to
   average away; real errors correlate across strikes/maturities (non-synchronous quotes, MM
   inventory). Likely to *strengthen* the model vs refit at large n.
-- n=60 gap: WLS still wins the densest slot (~0.0018 vs ~0.0034 at m=1).
+- n=60 gap (supervised): WLS still wins the densest slot (~0.0018 vs ~0.0034 at m=1).
 - Mid-input ablation: retrain the noisy model on mids to separate schema value from noise training.
-- CRPS-only run for the 80%-interval calibration.
-- Real-data transfer.
+- CRPS-only run for the 80%-interval calibration (supervised model runs slightly thin tails).
+- Quote-loss watch item: interval NLL alone leaves within-spread location underdetermined at
+  quote points; overlapping quotes + arb + prior pinned it here, revisit if real data behaves
+  differently (fallback: margin/quantile-outside penalty).
