@@ -37,13 +37,18 @@ def _init_params(cfg, n_restarts):
     return [np.clip(p, _BOUNDS[0], _BOUNDS[1]) for p in inits]
 
 
-def fit_ssvi(X, y, cfg, n_restarts=3):
-    """X is (n, 2) columns [k, tau], y is implied vol. Returns (params, cost)."""
+def fit_ssvi(X, y, cfg, n_restarts=3, weights=None):
+    """X is (n, 2) columns [k, tau], y is implied vol. Returns (params, cost).
+
+    `weights` (optional, per point) scale the total-variance residuals - for noisy
+    quotes with IV noise sd s_i use weights 1/(2*y_i*tau_i*s_i) (delta method:
+    dw = 2*sigma*tau*dsigma)."""
     k, ttm = X[:, 0], X[:, 1]
     y_w = y**2 * ttm  # fit in total-variance space
 
     def residuals(p):
-        return ssvi_w_pointwise(ttm, k, p) - y_w
+        r = ssvi_w_pointwise(ttm, k, p) - y_w
+        return r if weights is None else weights * r
 
     best = None
     for p0 in _init_params(cfg, n_restarts):

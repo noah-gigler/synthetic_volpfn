@@ -41,3 +41,38 @@ def eval_surfaces(model, train_list, test_list, cfg, reload_state=None):
     return tuple(np.mean(x) for x in (maes, mapes, cal_violations, butterfly_violations))
 
 
+def quantile_coverage(model, train_list, test_list, reload_state=None, levels=(0.2, 0.5, 0.8)):
+    """Empirical coverage of central predictive intervals on the query points.
+    Returns {level: mean fraction of true values inside the central `level` interval}."""
+    qs = sorted({q for lv in levels for q in ((1 - lv) / 2, 1 - (1 - lv) / 2)})
+    coverages = {lv: [] for lv in levels}
+    for (X_tr, y_tr), (X_te, y_te) in zip(train_list, test_list):
+        model.fit(X_tr, y_tr)
+        if reload_state is not None:
+            model.model_.load_state_dict(reload_state)
+        preds = model.predict(X_te, output_type="quantiles", quantiles=list(qs))
+        for lv in levels:
+            lo = preds[qs.index((1 - lv) / 2)]
+            hi = preds[qs.index(1 - (1 - lv) / 2)]
+            coverages[lv].append(np.mean((y_te >= lo) & (y_te <= hi)))
+    return {lv: float(np.mean(c)) for lv, c in coverages.items()}
+
+
+def inside_spread_fraction(model, train_list, reload_state=None):
+    """Fraction of predictions at the quote locations lying within [bid, ask].
+    Expects the bid/ask schema from src.data_generation.noise: X = [k, tau, side]
+    with the first half of the rows bids and the second half asks."""
+    fracs = []
+    for X_tr, y_tr in train_list:
+        model.fit(X_tr, y_tr)
+        if reload_state is not None:
+            model.model_.load_state_dict(reload_state)
+        n = len(y_tr) // 2
+        X_query = X_tr[:n].copy()
+        X_query[:, 2] = 0.0  # ask for the true value at the quoted (k, tau)
+        y_pred = model.predict(X_query)
+        bid, ask = y_tr[:n], y_tr[n:]
+        fracs.append(np.mean((y_pred >= bid) & (y_pred <= ask)))
+    return float(np.mean(fracs))
+
+
