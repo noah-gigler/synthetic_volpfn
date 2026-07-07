@@ -36,23 +36,27 @@ _CHECKPOINTS_DIR = Path(__file__).resolve().parents[2] / "checkpoints"
 def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, scheduler=None,
               grad_clip=None, batch_size=1, loss_fn=None):
     # train pass if optimizer is given (gradient accumulation over batch_size surfaces),
-    # else no-grad val pass; loss_fn(estimator, surface, logits_BQL) overrides CRPS+MSE.
+    # else no-grad val pass; loss_fn(estimator, surface, logits_BQL) overrides CRPS+MSE
+    # and may return per-surface losses (G,) for grouped batches.
+    # each element of `surfaces` holds G>=1 equal-context surfaces stacked along the
+    # dataset-batch dim (one forward pass); batch_size still counts surfaces, so it
+    # should be a multiple of the provider's size_group for exact accumulation windows.
     # returns per-surface losses in input order
     training = optimizer is not None
     estimator.model_.train(training)
 
     losses = []
-    group_size = 1
+    n_left = sum(s.y_query.shape[0] for s in surfaces)
+    acc, window = 0, 1
     with torch.set_grad_enabled(training):
-        for i, surface in enumerate(surfaces):
-            if training and i % batch_size == 0:
+        for surface in surfaces:
+            if training and acc == 0:
                 optimizer.zero_grad()
-                group_size = min(batch_size, len(surfaces) - i)
+                window = min(batch_size, n_left)
 
             # each dataset has its own target statistics for the bar distribution
             estimator.raw_space_bardist_ = surface.raw_space_bardist
             estimator.znorm_space_bardist_ = surface.znorm_space_bardist
-            bardist_loss_fn = surface.znorm_space_bardist
 
             # cache context in executor - no gradient flows through this
             estimator.fit_from_preprocessed(
@@ -67,33 +71,40 @@ def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, schedul
             # differentiable forward on query points
             _, per_estim_logits, _ = estimator.forward(surface.X_query, use_inference_mode=False)
 
-            # list of [Q, B, L] per estimator -> [B*E, Q, L]
+            # list of [Q, B, L] per estimator -> [B*E, Q, L], surface-major rows
             logits_QBEL = torch.stack(per_estim_logits, dim=2)
             Q, B, E, L = logits_QBEL.shape
             logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
 
             if loss_fn is not None:
-                loss = loss_fn(estimator, surface, logits_BQL)
+                loss_vec = torch.atleast_1d(loss_fn(estimator, surface, logits_BQL))
             else:
-                targets_BQ = surface.y_query.repeat(B * E, 1).to(device)
-                loss = _compute_regression_loss(
-                    logits_BQL=logits_BQL,
-                    targets_BQ=targets_BQ,
-                    bardist_loss_fn=bardist_loss_fn,
-                    ce_loss_weight=0.0,
-                    crps_loss_weight=1.0,
-                    mse_loss_weight=1.0,
-                )
+                znorm_bardists = getattr(surface, "znorm_bardists", [surface.znorm_space_bardist] * B)
+                per_surface = []
+                for g in range(B):
+                    targets_BQ = surface.y_query[g].repeat(E, 1).to(device)
+                    per_surface.append(_compute_regression_loss(
+                        logits_BQL=logits_BQL[g * E:(g + 1) * E],
+                        targets_BQ=targets_BQ,
+                        bardist_loss_fn=znorm_bardists[g],
+                        ce_loss_weight=0.0,
+                        crps_loss_weight=1.0,
+                        mse_loss_weight=1.0,
+                    ))
+                loss_vec = torch.stack(per_surface)
 
+            n_left -= B
             if training:
-                (loss / group_size).backward()
-                if (i + 1) % batch_size == 0 or i == len(surfaces) - 1:
+                (loss_vec.sum() / window).backward()
+                acc += B
+                if acc >= window:
                     clip_grad_norm_(estimator.model_.parameters(), grad_clip)
                     optimizer.step()
                     if scheduler is not None:
                         scheduler.step()
+                    acc = 0
 
-            losses.append(loss.item())
+            losses.extend(loss_vec.tolist())
 
     estimator.model_.train()
     return losses
@@ -106,6 +117,7 @@ def finetune(
     n_epochs: int = 50,
     n_surfaces_per_epoch: int = 200,
     batch_size: int = 1,
+    group_size: int = 1,
     n_val_surfaces: int = 5,
     val_data: tuple[list, list] | None = None,
     val_every: int = 1,
@@ -117,6 +129,10 @@ def finetune(
     device: str = "cpu",
     seed: int = 0,
 ) -> TabPFNRegressor:
+    # grouped surfaces must not straddle accumulation windows; the data_provider must
+    # draw equal context sizes per group (size_group=group_size)
+    assert batch_size % group_size == 0, "batch_size must be a multiple of group_size"
+
     out = _CHECKPOINTS_DIR / run_name
     if out.exists():
         raise FileExistsError(
@@ -155,19 +171,19 @@ def finetune(
 
     val_surfaces = None
     if val_train is not None:
-        val_surfaces = preprocess_surfaces(estimator, val_train, val_test, rng)
+        val_surfaces = preprocess_surfaces(estimator, val_train, val_test, rng, group_size=group_size)
         val_sizes = [len(y_ctx) for _, y_ctx in val_train]
 
     log.info(
         "Starting finetuning: %d epochs x %d datasets, batch_size=%d (%d val surfaces every %d epochs), warmup_steps=%d/%d",
-        n_epochs, n_surfaces_per_epoch, batch_size, len(val_surfaces or []), val_every, warmup_steps, total_steps,
+        n_epochs, n_surfaces_per_epoch, batch_size, len(val_train or []), val_every, warmup_steps, total_steps,
     )
 
     for epoch in range(n_epochs):
         train, test = data_provider(n_surfaces_per_epoch)
 
-        surfaces = preprocess_surfaces(estimator, train, test, rng)
-        rng.shuffle(surfaces)
+        surfaces = preprocess_surfaces(estimator, train, test, rng, group_size=group_size)
+        rng.shuffle(surfaces)  # shuffles groups; surfaces within a group stay together
         train_losses = _run_pass(
             estimator, surfaces, perf_opts, device,
             optimizer=optimizer, scheduler=scheduler, grad_clip=grad_clip,

@@ -71,21 +71,21 @@ def _sample_regimes(noise_cfg, n, regime):
     return np.full(n, float(regime))
 
 
-def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None):
+def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None, size_group=1):
     # n_context counts quote locations (context holds 2*n_context rows)
     noise_cfg = cfg["noise"]
     ttms, ks, surfaces = generate_surfaces(cfg, n)
-    sizes = sample_context_sizes(n_context, n, dist=size_dist)
+    sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
     k_idx, t_idx = sample_sparse_points(ks, ttms, sizes, n_samples=n)
     regimes = _sample_regimes(noise_cfg, n, regime)
     return _noisy_split(ks, ttms, surfaces, k_idx, t_idx, regimes, noise_cfg)
 
 
-def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", regime=None):
+def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", regime=None, size_group=1):
     # query y = [bid, ask] at n_heldout held-out quote locations, NaN elsewhere; no true prices
     noise_cfg = cfg["noise"]
     ttms, ks, surfaces = generate_surfaces(cfg, n)
-    sizes = sample_context_sizes(n_context, n, dist=size_dist)
+    sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
     k_idx, t_idx = sample_sparse_points(ks, ttms, sizes + n_heldout, n_samples=n)
     regimes = _sample_regimes(noise_cfg, n, regime)
 

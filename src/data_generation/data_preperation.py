@@ -26,14 +26,19 @@ def sample_sparse_points(ks, ttms, n_points, n_samples):
     return [p[1] for p in pairs], [p[0] for p in pairs]
 
 
-def sample_context_sizes(n_context, n, dist="uniform"):
+def sample_context_sizes(n_context, n, dist="uniform", group=1):
+    # group>1: one size per group of surfaces (marginal dist unchanged) so equal-size
+    # groups can share a single batched forward pass in finetuning
     if np.isscalar(n_context):
         return np.full(n, n_context, dtype=int)
     lo, hi = n_context
+    m = -(-n // group)
     if dist == "uniform":
-        return np.random.randint(lo, hi + 1, size=n)
-    u = np.random.uniform(np.log(lo), np.log(hi + 1), size=n)
-    return np.minimum(np.exp(u).astype(int), hi)
+        sizes = np.random.randint(lo, hi + 1, size=m)
+    else:
+        u = np.random.uniform(np.log(lo), np.log(hi + 1), size=m)
+        sizes = np.minimum(np.exp(u).astype(int), hi)
+    return np.repeat(sizes, group)[:n]
 
 
 def grid_from_cfg(cfg):
@@ -71,9 +76,9 @@ def _split_context_query(ks, ttms, surfaces, k_idx, t_idx):
     return train, test
 
 
-def data_preparation(cfg, n, n_context, size_dist="uniform"):
+def data_preparation(cfg, n, n_context, size_dist="uniform", size_group=1):
     ttms, ks, surfaces = generate_surfaces(cfg, n)
-    sizes = sample_context_sizes(n_context, n, dist=size_dist)
+    sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
     k_idx, t_idx = sample_sparse_points(ks, ttms, sizes, n_samples=n)
     return _split_context_query(ks, ttms, surfaces, k_idx, t_idx)
 
