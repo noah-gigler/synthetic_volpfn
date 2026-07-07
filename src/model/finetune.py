@@ -141,6 +141,16 @@ def finetune(
     out.mkdir(parents=True)
     best_loss = float("inf")
 
+    # mirror the log into the run's checkpoint dir; drop any handler from a previous
+    # run in the same process (e.g. notebook reruns) so lines don't duplicate
+    root_logger = logging.getLogger()
+    for h in [h for h in root_logger.handlers if isinstance(h, logging.FileHandler)]:
+        root_logger.removeHandler(h)
+        h.close()
+    file_handler = logging.FileHandler(out / "train.log")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+    root_logger.addHandler(file_handler)
+
     estimator = TabPFNRegressor(
         fit_mode="batched",
         n_estimators=1,
