@@ -13,6 +13,7 @@ full 15x25 grid unless stated otherwise.
 | `ssvi_uniform_context_3_30` (formerly `..._accum4_long`) | uniform 3-30 | 15k steps, batch 4 | dominates everywhere clean: beats fixed-20 at n=20 (MAE 0.0010 vs 0.0018-ish) while best at small n |
 | `ssvi_noisy_uniform_3_60` | bid/ask schema, uniform 3-60 quotes | 15k steps, batch 4 | the noisy-quote model; see below |
 | `ssvi_quote_n20` / `ssvi_quote_n20_long` | bid/ask, fixed 20 quotes, **quote loss (no true prices)** | 500 / 15k steps, batch 4 | headline: truth-free parity with supervision; see below |
+| `ssvi_quote_uniform_3_60` | bid/ask, uniform 3-60 quotes, quote loss | 15k steps, batch 4 | truth-free parity at *all* sizes with one model; edge cliff above n~55; see below |
 
 ## Established findings
 
@@ -80,6 +81,34 @@ full 15x25 grid unless stated otherwise.
    varies with the noise regime (tight intervals = harder), which makes train_loss look noisier
    than the optimization actually is.
 
+10. **Variable-context quote loss: the fixed-20 parity generalizes — one truth-free model covers
+    3-60 quotes at supervised quality.** `ssvi_quote_uniform_3_60` (same loss/lambdas as the n20
+    run, n_context uniform 3-60, n_heldout=15, 15k steps; val flat by ~epoch 260). Sweep at
+    m in {0.5, 1, 2}, n in {3,...,60}, 50 test surfaces/slot: quote FT within 0.0002-0.0008 MAE
+    of the supervised model at *every* slot (~5-20% relative, nominally behind everywhere —
+    largest at n=60). vs WLS refit reproduces finding 6's noise-dependent crossover; new
+    datapoint: **WLS blows up at n=5 under noise** (mean MAE 0.067 at m=1, 0.037 at m=2 — heavy
+    tail of unidentifiable 5-point fits) while FT stays ~0.017 — the learned prior fails
+    gracefully where least-squares fails catastrophically. Denoising confirmed: FT ~2-2.5x below
+    the mid noise floor at n>=20.
+11. **Sparse-context arb violations are generic, not a quote-loss deficiency.** n=5, m=1,
+    100 surfaces, fresh process, identical draws: quote FT 5% cal / 8% butterfly vs supervised
+    4% / 6%, and largely the *same* surfaces violate (7 IDs in both lists). Magnitudes are real
+    (g down to -0.3/-0.65, calendar dw/dt down to -5e-3), and violators have ~2x the MAE of the
+    average surface — arb appears exactly on the draws the model gets wrong anyway. So the hinge
+    already matches implicit arb-free-truth supervision; to go below that, crank lambda (only the
+    quote model has the knob) or post-hoc SSVI projection at very sparse n.
+12. **Edge-of-training-range cliff at dense contexts — train to 60, deploy to <=50.** Inside-spread
+    fraction (m=1, 25 surfaces/slot, fresh process): quote FT 99.2% @ n=50 -> 80% @ 55 -> 51% @ 58;
+    supervised 91% -> 80% -> 79%; vanilla baseline flat 65-69% at all sizes (no cliff — uniformly
+    mediocre denoising). The cliff exists only in models finetuned with the uniform(3,60) context
+    distribution => training-distribution edge effect, not spread-NLL-specific (though the quote
+    model collapses harder at 58, and both FT models' truth-MAE is non-monotonic 40 -> 60 in the
+    sweep). Broad-based — all 25 surfaces < 90% at n=58 — so not filterable; keep ~10 quotes of
+    margin below the training max, or widen the training range if dense contexts are needed.
+    Flip side: away from the edge the quote model respects spreads *better* than the supervised
+    one (99.2% vs 91.3% at n=50, worst surface 96% vs 58%) — direct interval training pays.
+
 ## Known issue
 
 **Stale-kernel eval artifact**: long-lived Jupyter kernels produced 10-50x-worse MAE at specific
@@ -92,14 +121,14 @@ contradict training-val values.
 
 ## Open items
 
-- Variable-context quote-loss run (uniform 3-60), mirroring the supervised setup - capability
-  extension after the N=20 result; also the natural head-to-head at all sizes.
 - Real-data calibration: swap `quote_data_preparation` for a real-quote provider (chain ->
   context/held-out split); pretrain synthetic, finetune with the quote loss on market data.
 - Correlated quote noise (v2): current noise is independent per quote - the easiest kind to
   average away; real errors correlate across strikes/maturities (non-synchronous quotes, MM
   inventory). Likely to *strengthen* the model vs refit at large n.
-- n=60 gap (supervised): WLS still wins the densest slot (~0.0018 vs ~0.0034 at m=1).
+- n=60 gap: explained by the edge cliff (finding 12) - WLS wins the densest slot partly because
+  the FT models degrade there. If dense contexts matter, retrain with a wider range (e.g. 3-90)
+  and re-sweep; prediction: the FT-vs-WLS crossover at n=60 moves in FT's favor.
 - Mid-input ablation: retrain the noisy model on mids to separate schema value from noise training.
 - CRPS-only run for the 80%-interval calibration (supervised model runs slightly thin tails).
 - Quote-loss watch item: interval NLL alone leaves within-spread location underdetermined at
