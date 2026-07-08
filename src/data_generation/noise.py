@@ -25,14 +25,15 @@ def _bs_otm_price_vega(k, tau, sigma):
 
 def half_spread(k, tau, sigma, noise_cfg, regime=1.0):
     price, vega = _bs_otm_price_vega(k, tau, sigma)
-    s_price = regime * (noise_cfg["tick"] + noise_cfg["beta"] * price)
+    # proportional/inventory-risk component scales with market stress, tick effect does not
+    s_price = regime * noise_cfg["beta"] * price + noise_cfg["tick"]
     s = s_price / np.maximum(vega, 1e-300)
     s = s * np.exp(np.random.normal(0, noise_cfg["jitter_sigma"], np.shape(s)))
     return np.minimum(s, noise_cfg["cap"])
 
 
 def add_quote_noise(k, tau, sigma_true, noise_cfg, regime=1.0):
-    # true IV at a uniform random position inside the spread; regime=0 -> bid=ask=true
+    # true IV at a uniform random position inside the spread
     s = half_spread(k, tau, sigma_true, noise_cfg, regime)
     u = np.random.uniform(0, 1, np.shape(sigma_true))
     bid = np.maximum(sigma_true - u * 2 * s, 1e-4)
