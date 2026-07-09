@@ -10,9 +10,8 @@ def logitnormal(median, sigma, size):
 # Max η satisfying Theorem 4.2 (Gatheral & Jacquier 2013) butterfly arbitrage conditions:
 #   1. θφ(θ)(1+|ρ|) < 4  →  η(1+|ρ|) < 4
 #   2. θφ(θ)²(1+|ρ|) ≤ 4 →  η ≤ 2/sqrt(B(θ_min)·(1+|ρ|))
-def max_eta(rho, v_bar, v0, kappa, gamma):
+def max_eta(rho, v_bar, v0, kappa, gamma, t_min):
     bound1 = 4 / (1 + np.abs(rho))
-    t_min = 0.1
     theta_min = v_bar * t_min + (v0 - v_bar) / kappa * (1 - np.exp(-kappa * t_min))
     B_min = theta_min ** (1 - 2 * gamma) / (1 + theta_min) ** (2 - 2 * gamma)
     bound2 = 2 / np.sqrt(B_min * (1 + np.abs(rho)))
@@ -30,15 +29,15 @@ def sample_params(cfg, n):
     v0 = v_bar * ratio
 
 
-    eta = np.random.uniform(0, max_eta(rho, v_bar, v0, kappa, gamma), n)
+    eta = np.random.uniform(0, max_eta(rho, v_bar, v0, kappa, gamma, cfg["ttm"]["min"]), n)
 
     return rho, eta, gamma, v_bar, v0, kappa
 
 def ssvi(ttms, ks, rho, eta, gamma, v_bar, v0, kappa):
-    # dimensional casting for vectorization
-    # returns (n, dim(ttms), dim(ks))
+    # dimensional casting for vectorization; returns (n, dim(ttms), dim(ks last axis))
+    # ks: (n_k,) shared across ttm, or (n_ttm, n_k) wedge (k = z·√τ)
     ttms = ttms[None, :, None]
-    ks = ks[None, None, :]
+    ks = ks[None, None, :] if ks.ndim == 1 else ks[None, :, :]
     rho, eta, gamma, v_bar, v0, kappa = [x[:, None, None] for x in (rho, eta, gamma, v_bar, v0, kappa)]
 
     thetas = v_bar * ttms + (v0 - v_bar)/kappa * (1 - np.exp(-kappa * ttms))        # heston like term structure

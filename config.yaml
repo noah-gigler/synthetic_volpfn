@@ -34,12 +34,16 @@ noise:
 
 # grid settings
 # --------------------------------------------------------------------------
-k:
-  min: -0.5
+# z = k/√τ
+# Range is taken from OpDS (96.6% of volume on their data)
+# TODO: recallibrate this for our data
+
+z:
+  min: -1.5
   max: 0.5
   n_points: 25
 
 ttm:
-  min: 0.1
+  min: 0.02        # ~1 week short end
   max: 1.0
   n_points: 15

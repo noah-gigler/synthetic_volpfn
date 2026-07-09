@@ -3,24 +3,31 @@ import numpy as np
 from src.data_generation.data_preperation import grid_from_cfg
 
 
-def check_arbitrage(iv, ttms, ks, tol=-1e-10):
+def check_arbitrage(iv, ttms, zs, tol=-1e-10):
+    # (ρ, z) coordinates: ρ=√τ, z=k/√τ, k=z·√τ; total variance w = iv^2 * τ
     w = iv**2 * ttms[:, None]
+    rho = np.sqrt(ttms)
+    r_, z_ = rho[:, None], zs[None, :]
 
-    dw_dt = np.diff(w, axis=-2)
-    cal_violations = (dw_dt < tol).any(axis=(-2, -1))
+    # calendar: dw/dtau|_k = (1/2ρ)[w_ρ - (z/ρ) w_z] >= 0
+    w_rho = np.gradient(w, rho, axis=-2)
+    w_z = np.gradient(w, zs, axis=-1)
+    cal = (w_rho - (z_ / r_) * w_z) / (2 * r_)
+    cal_violations = (cal < tol).any(axis=(-2, -1))
 
-    dw = np.gradient(w, ks, axis=-1)
-    d2w = np.gradient(dw, ks, axis=-1)
-    g = (1 - ks * dw / (2 * w)) ** 2 - dw**2 / 4 * (1 / w + 0.25) + d2w / 2
+    # butterfly: w_k=w_z/ρ, w_kk=w_zz/ρ^2, k=zρ; Gatheral g >= 0
+    w_zz = np.gradient(w_z, zs, axis=-1)
+    w_k, w_kk, k = w_z / r_, w_zz / r_**2, z_ * r_
+    g = (1 - k * w_k / (2 * w)) ** 2 - w_k**2 / 4 * (1 / w + 0.25) + w_kk / 2
     butterfly_violations = (g < tol).any(axis=(-2, -1))
 
     return cal_violations, butterfly_violations
 
 
 def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
-    ttms, ks = grid_from_cfg(cfg)
-    iv = iv_flat.reshape(len(ttms), len(ks))
-    return check_arbitrage(iv, ttms, ks, tol=tol)
+    ttms, zs = grid_from_cfg(cfg)
+    iv = iv_flat.reshape(len(ttms), len(zs))
+    return check_arbitrage(iv, ttms, zs, tol=tol)
 
 
 def eval_surfaces(model, train_list, test_list, cfg, reload_state=None):
