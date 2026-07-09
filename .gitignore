@@ -2,6 +2,7 @@
 .DS_Store
 *.pt
 checkpoints/
+*.pkl
 
 # Python-generated files
 __pycache__/
