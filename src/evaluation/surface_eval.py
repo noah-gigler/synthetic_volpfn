@@ -1,6 +1,54 @@
 import numpy as np
+import torch
+
+from tabpfn import TabPFNRegressor
+from tabpfn.architectures.interface import PerformanceOptions
 
 from src.data_generation.data_preperation import grid_from_cfg
+from src.model.preprocessed_dataset import preprocess_surfaces
+
+_PERF = PerformanceOptions(force_recompute_layer=False, use_chunkwise_inference=False)
+_eval_estimator = None
+_pretrained_state = None
+
+
+def _get_eval_estimator():
+    # one batched estimator, built once and reused; callers swap weights via load_state_dict
+    # instead of re-fitting/reloading per surface (the old per-surface path was the bottleneck)
+    global _eval_estimator, _pretrained_state
+    if _eval_estimator is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        est = TabPFNRegressor(
+            fit_mode="batched", n_estimators=1, device=device,
+            inference_config={"FINGERPRINT_FEATURE": False},
+        )
+        est._initialize_model_variables()
+        est.model_.to(device)
+        est.model_.eval()
+        _pretrained_state = {k: v.detach().cpu().clone() for k, v in est.model_.state_dict().items()}
+        _eval_estimator = est
+    return _eval_estimator
+
+
+@torch.no_grad()
+def _predict_raw(est, surfaces):
+    # raw-space IV mean per surface, in the input surface order (groups preserve order)
+    preds = []
+    for s in surfaces:
+        est.raw_space_bardist_ = s.raw_space_bardist
+        est.znorm_space_bardist_ = s.znorm_space_bardist
+        est.fit_from_preprocessed(
+            s.X_context, s.y_context, s.cat_indices, s.configs,
+            performance_options=_PERF, no_refit=True,
+        )
+        _, per_estim_logits, _ = est.forward(s.X_query, use_inference_mode=False)
+        logits_QBEL = torch.stack(per_estim_logits, dim=2)
+        Q, B, E, L = logits_QBEL.shape
+        logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L).cpu()
+        for g in range(B):
+            iv = s.raw_bardists[g].mean(logits_BQL[g * E:(g + 1) * E]).mean(0)  # (Q,)
+            preds.append((iv.numpy(), s.y_query_raw[g].numpy()))
+    return preds
 
 
 def check_arbitrage(iv, ttms, zs, tol=-1e-10):
@@ -31,16 +79,19 @@ def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
 
 
 def eval_surfaces(model, train_list, test_list, cfg, reload_state=None):
-    maes, mapes, cal_violations, butterfly_violations = [], [], [], []
-    for (X_tr, y_tr), (X_te, y_te) in zip(train_list, test_list):
-        model.fit(X_tr, y_tr) # always resets weights (but is still needed to preprocess data)
-        if reload_state is not None:
-            model.model_.load_state_dict(reload_state)  # restore weights if finetuned
-        y_pred = model.predict(X_te)
+    # `model` is ignored except as an API anchor; a shared batched estimator does the work.
+    # reload_state=None evaluates the non-finetuned pretrained weights.
+    est = _get_eval_estimator()
+    est.model_.load_state_dict(reload_state if reload_state is not None else _pretrained_state)
 
+    rng = np.random.default_rng(0)
+    # group_size = len(train_list) so all consecutive same-shape surfaces batch into one forward
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, group_size=max(len(train_list), 1))
+
+    maes, mapes, cal_violations, butterfly_violations = [], [], [], []
+    for y_pred, y_te in _predict_raw(est, surfaces):
         maes.append(np.mean(np.abs(y_te - y_pred)))
         mapes.append(np.mean(np.abs((y_te - y_pred) / y_te)) * 100)
-
         cal_v, butterfly_v = check_arbitrage_flat(cfg, y_pred)
         cal_violations.append(cal_v)
         butterfly_violations.append(butterfly_v)
