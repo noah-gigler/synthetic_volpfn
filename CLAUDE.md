@@ -136,9 +136,9 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   that contradicts training-val values. The finetune-style path (`fit_from_preprocessed` + `forward`) has
   been immune throughout.
 - **`notebooks/`** — exploratory work: `tabpfn_test.ipynb` (baseline, non-finetuned TabPFN on SSVI surfaces),
-  `tabpfn_finetuning.ipynb` (drives/inspects the clean finetuning loop), `tabpfn_noisy_finetuning.ipynb`
-  (bid/ask-noise experiment: run cell + sweep/coverage/inside-spread/visual eval),
-  `tabpfn_quote_finetuning.ipynb` (quote-loss experiment — truth-free training; offline truth eval is
+  `tabpfn_clean_finetuning.ipynb` (drives/inspects the clean finetuning loop), `tabpfn_supervised_finetuning.ipynb`
+  (bid/ask-noise experiment, supervised on true IV: run cell + sweep/coverage/inside-spread/visual eval),
+  `tabpfn_arb_finetuning.ipynb` (quote/arb-loss experiment — truth-free training; offline truth eval is
   reporting only, never checkpoint selection), `ssvi_validation.ipynb` (sanity-checks the SSVI
   generator/arbitrage conditions).
 - **`notes/results_summary.md`** — running summary of all finetuning experiments and established
