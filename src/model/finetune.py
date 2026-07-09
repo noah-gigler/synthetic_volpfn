@@ -126,12 +126,15 @@ def finetune(
     weight_decay: float = 0.01,
     grad_clip: float = 1.0,
     warmup_ratio: float = 0.1,
-    device: str = "cpu",
+    device: str = "auto",
     seed: int = 0,
 ) -> TabPFNRegressor:
     # grouped surfaces must not straddle accumulation windows; the data_provider must
     # draw equal context sizes per group (size_group=group_size)
     assert batch_size % group_size == 0, "batch_size must be a multiple of group_size"
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     out = _CHECKPOINTS_DIR / run_name
     if out.exists():
