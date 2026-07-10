@@ -34,15 +34,23 @@ SSVI-generated surfaces as training data (see `VolSmoothing_with_TabPFN_proposal
 Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` → `src/model/finetune.py` → `checkpoints/`.
 
 - **`config.yaml`** — single source of truth for the SSVI parameter prior (median/sigma per parameter,
-  sampled as lognormal/logit-normal) and the `(k, ttm)` grid shape. Both data generation and finetuning
-  load this file directly.
+  sampled as lognormal/logit-normal) and the `(z, ttm)` grid shape (standardized moneyness `z`, not raw
+  `k`). Both data generation and finetuning load this file directly.
+- **`src/data_generation/grid.py`** — `Grid(cfg)` is the single source of truth for the evaluation
+  lattice: it computes the `(ttms, zs)` axes and the flattened ttm-major `tau/z/k` arrays (plus `rho=√τ`,
+  `shape`) **once**, and exposes `features()` (the model's `[z, tau]` view). The `k = z·√τ` law lives in
+  exactly one place — the `z_to_k`/`k_to_z` helpers here. Everything downstream builds a `Grid` and pulls
+  the coordinate it needs instead of re-`meshgrid`-ing or writing `√τ` inline. **The model is fed `z`, not
+  physical `k`** (the wedge self-similarity lives in `z`; feeding raw `k` empirically hurt the sparse-context
+  regime — see `notes/results_summary.md`); physical `k` is used only where the physics demands it (BS
+  spread pricing in `noise.py`, and the SSVI fit/eval, which are intrinsically `k`-parametrized).
 - **`src/data_generation/SSVI.py`** — samples SSVI parameters from the prior and evaluates the SSVI
-  parametrization on a `(ttm, k)` grid, vectorized over a batch of surfaces. Enforces butterfly-arbitrage
-  bounds on `eta` (Gatheral & Jacquier 2013, Theorem 4.2) when sampling.
+  parametrization on a `(ttm, k)` grid (physical `k`, from `Grid.k`), vectorized over a batch of surfaces.
+  Enforces butterfly-arbitrage bounds on `eta` (Gatheral & Jacquier 2013, Theorem 4.2) when sampling.
 - **`src/data_generation/data_preperation.py`** — turns full surfaces into (context, query) point sets:
-  `sample_sparse_points` draws a Gaussian ATM-weighted, uniform-in-ttm subset of grid indices as the
-  "sparse quotes" context; `data_preparation` builds the corresponding train/test `(X=[k,tau], y=iv)` arrays
-  per surface. `n_context` may be an int or a `(lo, hi)` tuple — `sample_context_sizes` then draws a
+  `sample_sparse_points` draws a Gaussian ATM-weighted (in `z`, `z=0` is ATM), uniform-in-ttm subset of grid
+  indices as the "sparse quotes" context; `data_preparation` builds the corresponding train/test
+  `(X=[z,tau], y=iv)` arrays per surface (via `Grid`). `generate_surfaces` returns `(grid, surfaces)`. `n_context` may be an int or a `(lo, hi)` tuple — `sample_context_sizes` then draws a
   per-surface size (uniform by default, `dist="log"` for log-uniform). `make_stratified_eval_set`
   presents the *same* surfaces at several fixed context sizes (size-major) for stable validation.
   Has a `__main__` smoke test that fits/predicts a single surface with vanilla `TabPFNRegressor`.
@@ -50,9 +58,9 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   (`noisy_data_preparation`, `make_noisy_stratified_eval_set`), mirroring `data_preperation.py`'s
   contracts so they plug into `finetune()` unchanged. Layered spread model (vega-based structural
   half-spread from `tick + beta*price`, per-surface lognormal regime, per-quote lognormal jitter,
-  cap), deliberately not recoverable from `(k, tau)` alone; the true IV sits at a uniform random
-  position inside the quoted spread (asymmetric — no mid is ever observed). Noisy schema:
-  `X = [k, tau, side]` with side −1=bid/+1=ask/0=true; each quote location contributes two context
+  cap), deliberately not recoverable from `(z, tau)` alone; the true IV sits at a uniform random
+  position inside the quoted spread (asymmetric — no mid is ever observed). The spread model prices in
+  physical `k = Grid.k`, but the feature schema is `X = [z, tau, side]` with side −1=bid/+1=ask/0=true; each quote location contributes two context
   rows, query rows are the full grid with side=0 and clean targets, and `n_context` counts quote
   *locations* (a context holds `2*n_context` rows — `finetune`'s val-breakdown labels show rows).
   Noise parameters live in `config.yaml` under `noise:`. Also hosts the truth-free providers for
@@ -67,8 +75,9 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   surfaces exactly at ≥6 points (parameter count) — it is the oracle baseline there.
 - **`src/model/preprocessed_dataset.py`** — `preprocess_surfaces(estimator, train, test, rng)` turns a
   `data_provider`'s pre-split `(context, query)` arrays into a list of TabPFN `RegressorBatch`es, one per
-  surface (naming note: "batch" is reserved for the `batch_size` gradient-accumulation notion in
-  `finetune.py`; a `RegressorBatch` here always holds a single surface). Deliberately *not* using TabPFN's own `tabpfn.finetuning.data_util.get_preprocessed_dataset_chunks`:
+  surface, or a group of up to `group_size` equal-context surfaces stacked on the dataset-batch dim (naming
+  note: "batch" here is the TabPFN dataset-batch dim, distinct from the `batch_size` gradient-accumulation
+  notion in `finetune.py`; `group_size=1` gives one surface per `RegressorBatch`). Deliberately *not* using TabPFN's own `tabpfn.finetuning.data_util.get_preprocessed_dataset_chunks`:
   that helper assumes one raw dataset that still needs a generic `split_fn`-based train/test split (plus lazy
   chunking for oversized datasets), neither of which applies here since context/query are already split and
   small. Preprocessing-config selection (`_initialize_dataset_preprocessing`, i.e. which pipelines/target
@@ -92,8 +101,14 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   with no gradient (`fit_from_preprocessed(..., no_refit=True)`), then does a differentiable forward pass on
   the query points to get bar-distribution logits and backprops a regression loss (`_compute_regression_loss`)
   against the model's own bar-distribution buckets. `batch_size` is an *effective* batch size implemented as
-  gradient accumulation (surfaces run sequentially, gradients averaged per optimizer step) — true batched
-  forward passes aren't possible because surfaces have ragged context sizes. Validation: pass a prebuilt
+  gradient accumulation (gradients averaged per optimizer step). Surfaces with equal context sizes *are*
+  run as a single true batched forward pass via `group_size`: `preprocess_surfaces(..., group_size=G)` packs
+  up to `G` consecutive equal-context surfaces onto TabPFN's dataset-batch dim, and `_run_pass` unpacks the
+  resulting `B` dimension (same path eval uses at `group_size=16`). To use it, have the `data_provider` draw
+  equal context sizes per group (`data_preparation(..., size_group=G)`) and pass `group_size=G` with
+  `batch_size` a multiple of `G` (asserted). Ragged context sizes only prevent stacking *across* different
+  sizes, not batching within a size; `group_size=1` reproduces the old one-surface-per-forward path
+  byte-identically. Validation: pass a prebuilt
   `val_data=(train, test)` (e.g. from a stratified eval-set helper) and `val_every=k`; val surfaces are
   preprocessed **once** up front (rebuilding would re-consume RNG and drift the val task), the log prints a
   per-context-size loss breakdown (labels = context *rows*), and `best.pt` only updates on val epochs. With
@@ -153,5 +168,6 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
 
 ## Conventions
 
-- Surfaces are always represented as `(n_ttm, n_k)` grids; flattening order is `ttm`-major (`TT, KK = meshgrid(ttms, ks, indexing="ij")`, then `.ravel()`).
-- Context/sparse-point sampling is always Gaussian-weighted toward ATM in `k` and uniform in `ttm`; this logic lives solely in `data_preperation.py` (`sample_sparse_points`) — `finetune.py` is data-agnostic and has no sampling logic of its own.
+- Surfaces are always represented as `(n_ttm, n_z)` grids; flattening order is `ttm`-major (`meshgrid(ttms, zs, indexing="ij")` then `.ravel()`, all done once inside `Grid`). Build a `Grid(cfg)` and read `g.z`/`g.k`/`g.tau`/`g.shape` — don't re-`meshgrid` or write `√τ` inline; the `k = z·√τ` law lives only in `grid.py` (`z_to_k`/`k_to_z`).
+- **The model's moneyness feature is standardized `z`, not physical `k`.** `k` appears only where the physics needs it: BS spread pricing in `noise.py` and the SSVI fit/eval (`fit_ssvi`, `predict_ssvi`, `generate_surfaces`). Any `z↔k` boundary conversion goes through `z_to_k`/`k_to_z`.
+- Context/sparse-point sampling is always Gaussian-weighted toward ATM in `z` (`z=0` is ATM) and uniform in `ttm`; this logic lives solely in `data_preperation.py` (`sample_sparse_points`) — `finetune.py` is data-agnostic and has no sampling logic of its own.

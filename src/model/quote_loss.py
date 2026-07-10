@@ -19,11 +19,11 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, grid_shape, lambda_cal=1.0,
     znorm_bardists = getattr(batch, "znorm_bardists", [batch.znorm_space_bardist] * G)
     raw_bardists = getattr(batch, "raw_bardists", [batch.raw_space_bardist] * G)
 
-    # (ρ, z) recovered from the lattice rows; k = z·√τ so z is shared across ttm rows
+    # (ρ, z) recovered from the lattice rows; feature col 0 is z directly (shared across ttm rows)
     tau = batch.X_query_raw[0, :n_grid, 1].to(logits_BQL.device).reshape(n_ttm, n_z)
-    kk = batch.X_query_raw[0, :n_grid, 0].to(logits_BQL.device).reshape(n_ttm, n_z)
+    zz = batch.X_query_raw[0, :n_grid, 0].to(logits_BQL.device).reshape(n_ttm, n_z)
     rho = torch.sqrt(tau[:, 0])                          # (n_ttm,)
-    zs = (kk / torch.sqrt(tau))[0]                       # (n_z,)
+    zs = zz[0]                                           # (n_z,)
     r_, z_ = rho.view(1, n_ttm, 1), zs.view(1, 1, n_z)
 
     losses = []

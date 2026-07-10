@@ -41,25 +41,22 @@ def add_quote_noise(k, tau, sigma_true, noise_cfg, regime=1.0):
     return bid, ask
 
 
-def _noisy_split(zs, ttms, surfaces, k_idx, t_idx, regimes, noise_cfg):
-    TT, ZZ = np.meshgrid(ttms, zs, indexing="ij")
-    KK = ZZ * np.sqrt(TT)                              # k = z·√τ
-    k_flat, tau_flat = KK.ravel(), TT.ravel()
-
+def _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg):
+    # model feature is (z, tau, side); physical k = z·√τ is only used for BS spread pricing
     train, test = [], []
     for i in range(len(surfaces)):
         sigma = surfaces[i].ravel()
-        idx = t_idx[i] * len(zs) + k_idx[i]
-        kq, tauq = k_flat[idx], tau_flat[idx]
+        idx = t_idx[i] * g.shape[1] + k_idx[i]
+        zq, kq, tauq = g.z[idx], g.k[idx], g.tau[idx]
 
         bid, ask = add_quote_noise(kq, tauq, sigma[idx], noise_cfg, regimes[i])
 
         X_train = np.column_stack([
-            np.tile(kq, 2), np.tile(tauq, 2), np.repeat([BID, ASK], len(kq)),
+            np.tile(zq, 2), np.tile(tauq, 2), np.repeat([BID, ASK], len(zq)),
         ])
         y_train = np.concatenate([bid, ask])
 
-        X_test = np.column_stack([k_flat, tau_flat, np.full(len(sigma), TRUE)])
+        X_test = np.column_stack([g.z, g.tau, np.full(len(sigma), TRUE)])
 
         train.append((X_train, y_train))
         test.append((X_test, sigma))
@@ -76,42 +73,39 @@ def _sample_regimes(noise_cfg, n, regime):
 def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None, size_group=1):
     # n_context counts quote locations (context holds 2*n_context rows)
     noise_cfg = cfg["noise"]
-    ttms, zs, surfaces = generate_surfaces(cfg, n)
+    g, surfaces = generate_surfaces(cfg, n)
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
-    k_idx, t_idx = sample_sparse_points(zs, ttms, sizes, n_samples=n)
+    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes, n_samples=n)
     regimes = _sample_regimes(noise_cfg, n, regime)
-    return _noisy_split(zs, ttms, surfaces, k_idx, t_idx, regimes, noise_cfg)
+    return _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg)
 
 
 def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", regime=None, size_group=1):
     # decoupled query: [constant arb lattice (side=0, y=NaN)] ++ [n_heldout quote rows (y=[bid,ask])]
     # true prices appear nowhere
     noise_cfg = cfg["noise"]
-    ttms, zs, surfaces = generate_surfaces(cfg, n)
+    g, surfaces = generate_surfaces(cfg, n)
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
-    k_idx, t_idx = sample_sparse_points(zs, ttms, sizes + n_heldout, n_samples=n)
+    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes + n_heldout, n_samples=n)
     regimes = _sample_regimes(noise_cfg, n, regime)
 
-    TT, ZZ = np.meshgrid(ttms, zs, indexing="ij")
-    KK = ZZ * np.sqrt(TT)                              # k = z·√τ
-    k_flat, tau_flat = KK.ravel(), TT.ravel()
-    grid_rows = np.column_stack([k_flat, tau_flat, np.full(len(k_flat), TRUE)])
-    n_grid = len(k_flat)
+    grid_rows = np.column_stack([g.z, g.tau, np.full(len(g.z), TRUE)])
+    n_grid = len(g.z)
 
     train, test = [], []
     for i in range(n):
         sigma = surfaces[i].ravel()
-        idx = t_idx[i] * len(zs) + k_idx[i]
-        kq, tauq = k_flat[idx], tau_flat[idx]
+        idx = t_idx[i] * g.shape[1] + k_idx[i]
+        zq, kq, tauq = g.z[idx], g.k[idx], g.tau[idx]
         bid, ask = add_quote_noise(kq, tauq, sigma[idx], noise_cfg, regimes[i])
 
         nc = len(idx) - n_heldout  # choice order is random -> first nc is a random split
         X_train = np.column_stack([
-            np.tile(kq[:nc], 2), np.tile(tauq[:nc], 2), np.repeat([BID, ASK], nc),
+            np.tile(zq[:nc], 2), np.tile(tauq[:nc], 2), np.repeat([BID, ASK], nc),
         ])
         y_train = np.concatenate([bid[:nc], ask[:nc]])
 
-        held_rows = np.column_stack([kq[nc:], tauq[nc:], np.full(n_heldout, TRUE)])
+        held_rows = np.column_stack([zq[nc:], tauq[nc:], np.full(n_heldout, TRUE)])
         X_test = np.vstack([grid_rows, held_rows])
         y_test = np.full((len(X_test), 2), np.nan)
         y_test[n_grid:] = np.column_stack([bid[nc:], ask[nc:]])
@@ -130,13 +124,13 @@ def make_quote_eval_set(cfg, n_surfaces, n_context, n_heldout, regime=None):
 def make_noisy_stratified_eval_set(cfg, n_surfaces, context_sizes, regime=None):
     # same n_surfaces at every size in context_sizes, size-major; noise drawn once (frozen)
     noise_cfg = cfg["noise"]
-    ttms, zs, surfaces = generate_surfaces(cfg, n_surfaces)
+    g, surfaces = generate_surfaces(cfg, n_surfaces)
     regimes = _sample_regimes(noise_cfg, n_surfaces, regime)
 
     train, test = [], []
     for size in context_sizes:
-        k_idx, t_idx = sample_sparse_points(zs, ttms, np.full(n_surfaces, size), n_samples=n_surfaces)
-        tr, te = _noisy_split(zs, ttms, surfaces, k_idx, t_idx, regimes, noise_cfg)
+        k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, np.full(n_surfaces, size), n_samples=n_surfaces)
+        tr, te = _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg)
         train += tr
         test += te
 

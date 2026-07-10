@@ -10,8 +10,9 @@ import yaml
 from tabpfn import TabPFNRegressor
 
 from src.data_generation.data_preperation import (
-    data_preparation, grid_from_cfg, make_stratified_eval_set,
+    data_preparation, make_stratified_eval_set,
 )
+from src.data_generation.grid import Grid, z_to_k
 from src.data_generation.noise import (
     make_noisy_stratified_eval_set, make_quote_eval_set,
     noisy_data_preparation, quote_data_preparation,
@@ -136,8 +137,7 @@ def _split_quotes(train):
 def _baselines(eval_set, cfg):
     # model-independent MAE baselines on the noisy eval set; needs bid/ask quotes so
     # returns None for the clean schema
-    ttms, ks = grid_from_cfg(cfg)
-    KK = ks[None, :] * np.sqrt(ttms[:, None])          # physical strike wedge k = z·√τ
+    g = Grid(cfg)
     out = {}
     for m, by_ctx in eval_set.items():
         rows = {}
@@ -147,8 +147,10 @@ def _baselines(eval_set, cfg):
             wls, mid = [], []
             for (X2, mq, s), (Xq, yq) in zip(_split_quotes(tr), te):
                 w = 1 / np.maximum(2 * mq * X2[:, 1] * s, 1e-10)
-                params, _ = fit_ssvi(X2, mq, cfg, weights=w)
-                wls.append(np.mean(np.abs(predict_ssvi(params, ttms, KK).ravel() - yq)))
+                # feature col 0 is z; SSVI fits/predicts in physical strike k
+                X2_k = np.column_stack([z_to_k(X2[:, 0], X2[:, 1]), X2[:, 1]])
+                params, _ = fit_ssvi(X2_k, mq, cfg, weights=w)
+                wls.append(np.mean(np.abs(predict_ssvi(params, g.ttms, g.k.reshape(g.shape)).ravel() - yq)))
                 idx = [np.where((Xq[:, 0] == X2[i, 0]) & (Xq[:, 1] == X2[i, 1]))[0][0]
                        for i in range(len(mq))]
                 mid.append(np.abs(mq - yq[idx]).mean())
@@ -222,12 +224,11 @@ def main():
     spec = EXPERIMENTS[args.experiment]
     run_name = args.run_name or f"{args.experiment}_{args.n_context[0]}_{args.n_context[1]}"
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
-    ttms, ks = grid_from_cfg(cfg)
 
     if not args.eval_only:
         val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val)
         data_provider = spec["provider"](cfg, tuple(args.n_context))
-        loss_fn = spec["loss"](cfg, (len(ttms), len(ks)))
+        loss_fn = spec["loss"](cfg, Grid(cfg).shape)
         finetune(
             data_provider, run_name=run_name, n_epochs=args.epochs,
             n_surfaces_per_epoch=args.n_surfaces, batch_size=spec["batch_size"],

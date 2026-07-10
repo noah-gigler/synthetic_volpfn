@@ -4,7 +4,7 @@ import torch
 from tabpfn import TabPFNRegressor
 from tabpfn.architectures.interface import PerformanceOptions
 
-from src.data_generation.data_preperation import grid_from_cfg
+from src.data_generation.grid import Grid
 from src.model.preprocessed_dataset import preprocess_surfaces
 
 _PERF = PerformanceOptions(force_recompute_layer=False, use_chunkwise_inference=False)
@@ -73,9 +73,8 @@ def check_arbitrage(iv, ttms, zs, tol=-1e-10):
 
 
 def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
-    ttms, zs = grid_from_cfg(cfg)
-    iv = iv_flat.reshape(len(ttms), len(zs))
-    return check_arbitrage(iv, ttms, zs, tol=tol)
+    g = Grid(cfg)
+    return check_arbitrage(iv_flat.reshape(g.shape), g.ttms, g.zs, tol=tol)
 
 
 def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=16):

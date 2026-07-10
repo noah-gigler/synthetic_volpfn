@@ -6,3 +6,6 @@
 stretch goals:
 
 - parameter uncertainty instead of pointwise uncertainty ()
+
+
+UPDATE NOTEBOOKS TO NEW GRID METHOD

@@ -1,5 +1,6 @@
 import numpy as np
 from src.data_generation.SSVI import ssvi, sample_params
+from src.data_generation.grid import Grid
 
 # gaussian z sampling with mean ATM (z=0)
 # uniform ttm sampling as the tau grid is already denser at the short end (rho=sqrt(tau) uniform)
@@ -41,44 +42,23 @@ def sample_context_sizes(n_context, n, dist="uniform", group=1):
     return np.repeat(sizes, group)[:n]
 
 
-def grid_from_cfg(cfg):
-    # (ρ, z) grid: ρ=√τ uniform (τ quadratic-spaced), z uniform from the config k-block
-    rho = np.linspace(np.sqrt(cfg["ttm"]["min"]), np.sqrt(cfg["ttm"]["max"]), cfg["ttm"]["n_points"])
-    zs = np.linspace(cfg["z"]["min"], cfg["z"]["max"], cfg["z"]["n_points"])
-    return rho**2, zs
-
-
-def grid_points(cfg):
-    # flattened physical grid (ttm-major); standardized moneyness z mapped to k = z·√τ
-    ttms, zs = grid_from_cfg(cfg)
-    TT, ZZ = np.meshgrid(ttms, zs, indexing="ij")
-    return (ZZ * np.sqrt(TT)).ravel(), TT.ravel()
-
-
 def generate_surfaces(cfg, n):
-    ttms, zs = grid_from_cfg(cfg)
-    KK = zs[None, :] * np.sqrt(ttms[:, None])          # (n_ttm, n_z) wedge, k = z·√τ
-
+    g = Grid(cfg)
     rho, eta, gamma, v_bar, v0, kappa = sample_params(cfg, n)
-    surfaces = ssvi(ttms, KK, rho, eta, gamma, v_bar, v0, kappa)
+    surfaces = ssvi(g.ttms, g.k.reshape(g.shape), rho, eta, gamma, v_bar, v0, kappa)
+    return g, surfaces
 
-    return ttms, zs, surfaces
 
-
-def _split_context_query(zs, ttms, surfaces, k_idx, t_idx):
-    TT, ZZ = np.meshgrid(ttms, zs, indexing='ij')
-    KK = ZZ * np.sqrt(TT)                              # k = z·√τ
-    k_flat   = KK.ravel()
-    tau_flat = TT.ravel()
-
+def _split_context_query(g, surfaces, k_idx, t_idx):
+    # model feature is (z, tau); the wedge structure lives in z, so feed z not k = z·√τ
     train, test = [], []
     for i in range(len(surfaces)):
         sigma = surfaces[i].ravel()
-        train_idx = t_idx[i] * len(zs) + k_idx[i]
+        train_idx = t_idx[i] * g.shape[1] + k_idx[i]
 
         # query is the full grid, including context points
-        X_train, y_train = np.column_stack([k_flat[train_idx], tau_flat[train_idx]]), sigma[train_idx]
-        X_test,  y_test  = np.column_stack([k_flat, tau_flat]), sigma
+        X_train, y_train = np.column_stack([g.z[train_idx], g.tau[train_idx]]), sigma[train_idx]
+        X_test,  y_test  = g.features(), sigma
 
         train.append((X_train, y_train))
         test.append((X_test,  y_test))
@@ -87,19 +67,19 @@ def _split_context_query(zs, ttms, surfaces, k_idx, t_idx):
 
 
 def data_preparation(cfg, n, n_context, size_dist="uniform", size_group=1):
-    ttms, zs, surfaces = generate_surfaces(cfg, n)
+    g, surfaces = generate_surfaces(cfg, n)
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
-    k_idx, t_idx = sample_sparse_points(zs, ttms, sizes, n_samples=n)
-    return _split_context_query(zs, ttms, surfaces, k_idx, t_idx)
+    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes, n_samples=n)
+    return _split_context_query(g, surfaces, k_idx, t_idx)
 
 
 def make_stratified_eval_set(cfg, n_surfaces, context_sizes):
-    ttms, zs, surfaces = generate_surfaces(cfg, n_surfaces)
+    g, surfaces = generate_surfaces(cfg, n_surfaces)
 
     train, test = [], []
     for size in context_sizes:
-        k_idx, t_idx = sample_sparse_points(zs, ttms, np.full(n_surfaces, size), n_samples=n_surfaces)
-        tr, te = _split_context_query(zs, ttms, surfaces, k_idx, t_idx)
+        k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, np.full(n_surfaces, size), n_samples=n_surfaces)
+        tr, te = _split_context_query(g, surfaces, k_idx, t_idx)
         train += tr
         test += te
 
