@@ -61,6 +61,8 @@ def _arb_val(cfg):
     return sum((s[0] for s in sets), []), sum((s[1] for s in sets), [])
 
 
+GROUP_SIZE = 8
+BATCH_SIZE = 32
 EXPERIMENTS = {
     "clean": dict(
         provider=lambda cfg, n_ctx: partial(data_preparation, cfg, n_context=n_ctx),
@@ -70,19 +72,19 @@ EXPERIMENTS = {
         group_size=1, batch_size=4,
     ),
     "supervised": dict(
-        provider=lambda cfg, n_ctx: partial(noisy_data_preparation, cfg, n_context=n_ctx),
+        provider=lambda cfg, n_ctx: partial(noisy_data_preparation, cfg, n_context=n_ctx,  size_group=GROUP_SIZE),
         val=_supervised_val,
         loss=lambda cfg, grid: None,
         eval_schema="noisy",
-        group_size=4, batch_size=8,
+        group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
     ),
     "arb": dict(
         provider=lambda cfg, n_ctx: partial(
-            quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=4),
+            quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE),
         val=_arb_val,
         loss=lambda cfg, grid: partial(quote_arb_loss, grid_shape=grid, lambda_cal=1.0, lambda_bf=1.0),
         eval_schema="noisy",
-        group_size=4, batch_size=8,
+        group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
     ),
 }
 
@@ -144,17 +146,21 @@ def _baselines(eval_set, cfg):
         for n_ctx, (tr, te) in by_ctx.items():
             if tr[0][0].shape[1] < 3:                  # clean context, no spread
                 return None
-            wls, mid = [], []
+            wls, wls_mape, mid = [], [], []
             for (X2, mq, s), (Xq, yq) in zip(_split_quotes(tr), te):
                 w = 1 / np.maximum(2 * mq * X2[:, 1] * s, 1e-10)
                 # feature col 0 is z; SSVI fits/predicts in physical strike k
                 X2_k = np.column_stack([z_to_k(X2[:, 0], X2[:, 1]), X2[:, 1]])
                 params, _ = fit_ssvi(X2_k, mq, cfg, weights=w)
-                wls.append(np.mean(np.abs(predict_ssvi(params, g.ttms, g.k.reshape(g.shape)).ravel() - yq)))
+                pred = predict_ssvi(params, g.ttms, g.k.reshape(g.shape)).ravel()
+                wls.append(np.mean(np.abs(pred - yq)))
+                wls_mape.append(np.mean(np.abs((yq - pred) / yq)) * 100)
                 idx = [np.where((Xq[:, 0] == X2[i, 0]) & (Xq[:, 1] == X2[i, 1]))[0][0]
                        for i in range(len(mq))]
                 mid.append(np.abs(mq - yq[idx]).mean())
-            rows[n_ctx] = dict(refit_wls=float(np.mean(wls)), mid=float(np.mean(mid)))
+            rows[n_ctx] = dict(refit_wls=float(np.mean(wls)),
+                               refit_wls_mape=float(np.mean(wls_mape)),
+                               mid=float(np.mean(mid)))
         out[m] = rows
     return out
 
@@ -173,15 +179,21 @@ def load_baselines(schema, cfg, eval_set, rebuild=False):
 def _write_eval_txt(path, experiment, results, baselines):
     lines = []
     for m, rows in results.items():
-        lines.append(f"\n=== regime={m} (MAE vs truth) ===")
-        header = f"{'n_ctx':>6} {experiment:>12} {'refit WLS':>12} {'mid straw':>12}"
-        lines.append(header if baselines is not None else f"{'n_ctx':>6} {experiment:>12}")
+        lines.append(f"\n=== regime={m} (MAE | MAPE% vs truth) ===")
+        sup_mape = f"{experiment + ' MAPE':>15}"
+        if baselines is not None:
+            header = (f"{'n_ctx':>6} {experiment:>12} {'refit WLS':>12} {'mid straw':>12}"
+                      f"{sup_mape} {'WLS MAPE':>12}")
+        else:
+            header = f"{'n_ctx':>6} {experiment:>12}{sup_mape}"
+        lines.append(header)
         for n_ctx, r in rows.items():
             if baselines is not None:
                 b = baselines[float(m)][int(n_ctx)]
-                lines.append(f"{n_ctx:>6} {r['mae']:>12.4f} {b['refit_wls']:>12.4f} {b['mid']:>12.4f}")
+                lines.append(f"{n_ctx:>6} {r['mae']:>12.4f} {b['refit_wls']:>12.4f} {b['mid']:>12.4f}"
+                             f" {r['mape']:>14.2f}% {b['refit_wls_mape']:>11.2f}%")
             else:
-                lines.append(f"{n_ctx:>6} {r['mae']:>12.4f}")
+                lines.append(f"{n_ctx:>6} {r['mae']:>12.4f} {r['mape']:>14.2f}%")
     open(path, "w").write("\n".join(lines) + "\n")
 
 
@@ -214,6 +226,8 @@ def main():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--n-surfaces", type=int, default=200)
     p.add_argument("--n-context", type=int, nargs=2, default=(3, 60), metavar=("LO", "HI"))
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--group-size", type=int, default=None)
     p.add_argument("--val-every", type=int, default=5)
     p.add_argument("--device", default="cuda")
     p.add_argument("--rebuild-val", action="store_true")
@@ -231,8 +245,8 @@ def main():
         loss_fn = spec["loss"](cfg, Grid(cfg).shape)
         finetune(
             data_provider, run_name=run_name, n_epochs=args.epochs,
-            n_surfaces_per_epoch=args.n_surfaces, batch_size=spec["batch_size"],
-            group_size=spec["group_size"], val_data=val_data, val_every=args.val_every,
+            n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size or spec["batch_size"],
+            group_size=args.group_size or spec["group_size"], val_data=val_data, val_every=args.val_every,
             loss_fn=loss_fn, device=args.device,
         )
 
