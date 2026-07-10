@@ -3,6 +3,8 @@
 *.pt
 checkpoints/
 *.pkl
+datasets/
+*.json
 
 # Python-generated files
 __pycache__/
@@ -14,4 +16,4 @@ wheels/
 
 # Virtual environments
 .venv
-
+.env
