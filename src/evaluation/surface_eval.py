@@ -78,15 +78,16 @@ def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
     return check_arbitrage(iv, ttms, zs, tol=tol)
 
 
-def eval_surfaces(model, train_list, test_list, cfg, reload_state=None):
+def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=16):
     # `model` is ignored except as an API anchor; a shared batched estimator does the work.
     # reload_state=None evaluates the non-finetuned pretrained weights.
     est = _get_eval_estimator()
     est.model_.load_state_dict(reload_state if reload_state is not None else _pretrained_state)
 
     rng = np.random.default_rng(0)
-    # group_size = len(train_list) so all consecutive same-shape surfaces batch into one forward
-    surfaces = preprocess_surfaces(est, train_list, test_list, rng, group_size=max(len(train_list), 1))
+    # cap the forward batch so peak GPU memory stays bounded regardless of len(train_list);
+    # ~16 same-shape surfaces peaks ~5 GiB, well under a 14.5 GiB card (scripts/probe_eval_batch.py)
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, group_size=group_size)
 
     maes, mapes, cal_violations, butterfly_violations = [], [], [], []
     for y_pred, y_te in _predict_raw(est, surfaces):

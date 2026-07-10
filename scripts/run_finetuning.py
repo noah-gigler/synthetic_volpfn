@@ -188,12 +188,13 @@ def run_eval(experiment, run_name, cfg, device, rebuild_eval=False):
     eval_set = load_eval(spec["eval_schema"], cfg, rebuild=rebuild_eval)
     model, state = load_finetuned(run_name, device)
     results = {}
-    for m, by_ctx in eval_set.items():
-        rows = {}
-        for n_ctx, (tr, te) in by_ctx.items():
-            mae, mape, cal, bf = eval_surfaces(model, tr, te, cfg, reload_state=state)
-            rows[n_ctx] = dict(mae=mae, mape=mape, cal_viol=cal, bf_viol=bf)
-        results[str(m)] = rows
+    slots = [(m, n_ctx) for m, by_ctx in eval_set.items() for n_ctx in by_ctx]
+    for i, (m, n_ctx) in enumerate(slots, 1):
+        tr, te = eval_set[m][n_ctx]
+        print(f"[{i}/{len(slots)}] regime={m} n_ctx={n_ctx} ...", flush=True)
+        mae, mape, cal, bf = eval_surfaces(model, tr, te, cfg, reload_state=state)
+        results.setdefault(str(m), {})[n_ctx] = dict(
+            mae=float(mae), mape=float(mape), cal_viol=float(cal), bf_viol=float(bf))
 
     baselines = load_baselines(spec["eval_schema"], cfg, eval_set, rebuild=rebuild_eval)
 
