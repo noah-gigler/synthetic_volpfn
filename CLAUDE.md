@@ -29,6 +29,19 @@ SSVI-generated surfaces as training data (see `VolSmoothing_with_TabPFN_proposal
 - No test suite, linter, or build step currently exists in this repo.
 - Notebooks are stripped of output on commit via `nbstripout` (declared dependency).
 
+## Real data / Databento cost
+
+- **`src/real_data/`** hits Databento (OPRA.PILLAR, `cbbo-1m`, SPXW). These consume paid credits — never
+  run them from an automated/agent context; the user runs them.
+- **Billing is per 5-min-aligned block, not per record you request.** OPRA is stored time-partitioned on
+  `:00/:05/:10/:15` boundaries and every query is billed for *every block it overlaps* (even by a second).
+  A window inside one block (e.g. `16:10:00–16:15:00`) = 1 block; crossing a `:05` boundary (e.g. `16:09–16:15`)
+  = 2 blocks ≈ 2× cost for almost no extra data. There is **no flat $0.025 floor** — per-block cost is
+  record-count driven and varies by day (~$0.012–0.025 for the SPXW EOD block; ~$3–6 per trading year).
+- **EOD snapshot rule:** pull exactly one aligned block `16:10:00–16:15:00 ET` per trading day (5 one-min bars
+  at minimum cost — you pay for the whole block regardless, so take all of it). Keep the window snapped inside
+  `[16:10, 16:15)`; never cross a `:05` boundary. The 16:15 SPXW close is the block end.
+
 ## Architecture
 
 Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` → `src/model/finetune.py` → `checkpoints/`.
