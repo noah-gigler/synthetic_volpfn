@@ -5,7 +5,7 @@ Parameter order matches the generator: (rho, eta, gamma, v_bar, v0, kappa).
 import numpy as np
 from scipy.optimize import least_squares
 
-from src.data_generation.SSVI import ssvi, sample_params
+from src.data_generation.SSVI import sample_params
 
 PARAM_NAMES = ("rho", "eta", "gamma", "v_bar", "v0", "kappa")
 
@@ -55,4 +55,4 @@ def fit_ssvi(X, y, cfg, n_restarts=3, weights=None):
 
 
 def predict_ssvi(params, ttms, ks):
-    return ssvi(ttms, ks, *[np.array([p]) for p in params])[0]
+    return ssvi_iv_pointwise(ttms, ks, params)
