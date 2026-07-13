@@ -5,7 +5,7 @@ import torch
 
 
 def quote_arb_loss(estimator, batch, logits_BQL, *, grid_shape, lambda_cal=1.0,
-                   lambda_bf=1.0, min_prob=1e-6):
+                   lambda_bf=1.0, min_prob=1e-6, return_parts=False):
     # returns per-surface losses (G,) for a possibly grouped batch (G surfaces, E estimators).
     # query = [arb lattice (first n_grid rows) | held-out quote rows]; arb reads the lattice,
     # NLL reads the finite (held-out) rows.
@@ -26,7 +26,7 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, grid_shape, lambda_cal=1.0,
     zs = zz[0]                                           # (n_z,)
     r_, z_ = rho.view(1, n_ttm, 1), zs.view(1, 1, n_z)
 
-    losses = []
+    losses, nlls, cals, bfs = [], [], [], []
     for g in range(G):
         logits = logits_BQL[g * E:(g + 1) * E]
         bardist = znorm_bardists[g]
@@ -54,5 +54,12 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, grid_shape, lambda_cal=1.0,
         bf = torch.relu(-g_fn).mean()
 
         losses.append(nll + lambda_cal * cal + lambda_bf * bf)
+        nlls.append(nll)
+        cals.append(cal)
+        bfs.append(bf)
 
-    return torch.stack(losses)
+    total = torch.stack(losses)
+    if return_parts:
+        parts = {"nll": torch.stack(nlls), "cal": torch.stack(cals), "bf": torch.stack(bfs)}
+        return total, parts
+    return total

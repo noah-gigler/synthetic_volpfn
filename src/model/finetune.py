@@ -46,6 +46,7 @@ def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, schedul
     estimator.model_.train(training)
 
     losses = []
+    parts: dict[str, list[float]] = {}
     n_left = sum(s.y_query.shape[0] for s in surfaces)
     acc, window = 0, 1
     with torch.set_grad_enabled(training):
@@ -77,7 +78,12 @@ def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, schedul
             logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
 
             if loss_fn is not None:
-                loss_vec = torch.atleast_1d(loss_fn(estimator, surface, logits_BQL))
+                out = loss_fn(estimator, surface, logits_BQL)
+                if isinstance(out, tuple):
+                    out, part_vecs = out
+                    for name, vec in part_vecs.items():
+                        parts.setdefault(name, []).extend(torch.atleast_1d(vec).tolist())
+                loss_vec = torch.atleast_1d(out)
             else:
                 znorm_bardists = getattr(surface, "znorm_bardists", [surface.znorm_space_bardist] * B)
                 per_surface = []
@@ -107,7 +113,7 @@ def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, schedul
             losses.extend(loss_vec.tolist())
 
     estimator.model_.train()
-    return losses
+    return losses, parts
 
 
 def finetune(
@@ -197,7 +203,7 @@ def finetune(
 
         surfaces = preprocess_surfaces(estimator, train, test, rng, group_size=group_size)
         rng.shuffle(surfaces)  # shuffles groups; surfaces within a group stay together
-        train_losses = _run_pass(
+        train_losses, train_parts = _run_pass(
             estimator, surfaces, perf_opts, device,
             optimizer=optimizer, scheduler=scheduler, grad_clip=grad_clip,
             batch_size=batch_size, loss_fn=loss_fn,
@@ -205,8 +211,10 @@ def finetune(
         train_loss = float(np.mean(train_losses))
 
         is_val_epoch = val_surfaces is not None and ((epoch + 1) % val_every == 0 or epoch == n_epochs - 1)
+        parts_str = "".join(f" {k}={np.mean(v):.4g}" for k, v in train_parts.items())
+
         if is_val_epoch:
-            val_losses = _run_pass(estimator, val_surfaces, perf_opts, device, loss_fn=loss_fn)
+            val_losses, _ = _run_pass(estimator, val_surfaces, perf_opts, device, loss_fn=loss_fn)
             val_loss = float(np.mean(val_losses))
 
             by_size: dict[int, list[float]] = {}
@@ -214,14 +222,14 @@ def finetune(
                 by_size.setdefault(size, []).append(surface_loss)
             breakdown = " ".join(f"{s}={np.mean(v):.4f}" for s, v in sorted(by_size.items()))
             log.info(
-                "Epoch %d/%d | train_loss=%.4f val_loss=%.4f | by n_ctx: %s",
-                epoch + 1, n_epochs, train_loss, val_loss, breakdown,
+                "Epoch %d/%d | train_loss=%.4f%s val_loss=%.4f | by n_ctx: %s",
+                epoch + 1, n_epochs, train_loss, parts_str, val_loss, breakdown,
             )
         else:
             # no comparable val loss this epoch; only track best via train loss when
             # there is no val set at all
             val_loss = train_loss if val_surfaces is None else None
-            log.info("Epoch %d/%d | train_loss=%.4f", epoch + 1, n_epochs, train_loss)
+            log.info("Epoch %d/%d | train_loss=%.4f%s", epoch + 1, n_epochs, train_loss, parts_str)
 
         if val_loss is not None and val_loss < best_loss:
             best_loss = val_loss
