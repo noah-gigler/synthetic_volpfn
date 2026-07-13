@@ -154,15 +154,6 @@ Data flow: `config.yaml` (SSVI prior + grid settings) → `src/data_generation` 
   TabPFN quantile output) and `inside_spread_fraction` (predictions within [bid, ask] at quote locations;
   note the synthetic truth *always* lies inside the spread by construction, so ~100% is expected of a good
   model — the metric only flags pathologies, it cannot distinguish denoising from mid-interpolation).
-- **Evaluate in a fresh kernel/process — known stale-kernel artifact.** Long-lived Jupyter kernels have
-  twice produced corrupted eval results at specific (model, context-size) slots: 10-50x worse MAE,
-  deterministic within the session (same slots across independent data draws), different slots each
-  session, affecting even the vanilla non-finetuned baseline, and never reproducible in a fresh process.
-  A controlled ordering experiment (same slot evaluated before vs after a sweep-like history in one fresh
-  process) showed no effect, ruling out a simple shape-keyed cache; root cause unknown. Mitigation:
-  restart the kernel before eval cells, or run sweep slots in subprocesses; distrust any in-kernel number
-  that contradicts training-val values. The finetune-style path (`fit_from_preprocessed` + `forward`) has
-  been immune throughout.
 - **`notebooks/`** — exploratory work: `tabpfn_test.ipynb` (baseline, non-finetuned TabPFN on SSVI surfaces),
   `tabpfn_clean_finetuning.ipynb` (drives/inspects the clean finetuning loop), `tabpfn_supervised_finetuning.ipynb`
   (bid/ask-noise experiment, supervised on true IV: run cell + sweep/coverage/inside-spread/visual eval),
