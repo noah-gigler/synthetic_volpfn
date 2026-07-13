@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import databento as db
 
-if "_testcapi" not in sys.modules:  # vollib's LBR backend imports DBL_MIN/MAX from it; not always built
+if "_testcapi" not in sys.modules:  # vollib imports DBL_MIN/MAX. hacky fix
     _shim = types.ModuleType("_testcapi")
     _shim.DBL_MIN, _shim.DBL_MAX = sys.float_info.min, sys.float_info.max
     sys.modules["_testcapi"] = _shim
