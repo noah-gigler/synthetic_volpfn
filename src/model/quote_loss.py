@@ -45,13 +45,16 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, grid_shape, lambda_cal=1.0,
         # calendar: dw/dtau|_k = (1/2ρ)[w_ρ - (z/ρ) w_z] >= 0   (ρ uniform -> clean stencil)
         w_rho = torch.gradient(w, spacing=(rho,), dim=-2)[0]
         w_z = torch.gradient(w, spacing=(zs,), dim=-1)[0]
-        cal = torch.relu(-(w_rho - (z_ / r_) * w_z) / (2 * r_)).mean()
+        # average over violating cells (helps clean up last arb points)
+        cal_v = torch.relu(-(w_rho - (z_ / r_) * w_z) / (2 * r_))
+        cal = cal_v.sum() / (cal_v > 0).sum().clamp_min(1)
 
         # butterfly: at fixed tau d/dk = (1/ρ)d/dz -> w_k=w_z/ρ, w_kk=w_zz/ρ^2, k=zρ; Gatheral g >= 0
         w_zz = torch.gradient(w_z, spacing=(zs,), dim=-1)[0]
         w_k, w_kk, k = w_z / r_, w_zz / r_**2, z_ * r_
         g_fn = (1 - k * w_k / (2 * w)) ** 2 - w_k**2 / 4 * (1 / w + 0.25) + w_kk / 2
-        bf = torch.relu(-g_fn).mean()
+        bf_v = torch.relu(-g_fn)
+        bf = bf_v.sum() / (bf_v > 0).sum().clamp_min(1)
 
         losses.append(nll + lambda_cal * cal + lambda_bf * bf)
         nlls.append(nll)
