@@ -58,10 +58,11 @@ def _split_surface(s, nc, grid=None, n_heldout=None):
 
 
 def build_task(pool, n, n_context, grid=None, n_heldout=None, size_group=1):
+    gr = grid() if callable(grid) else grid    # callable -> fresh (e.g. jittered) grid per call
     sizes = sample_context_sizes(n_context, n, group=size_group)
     train, test = [], []
     for nc in sizes:
-        tr, te = _split_surface(pool[np.random.randint(len(pool))], nc, grid, n_heldout)
+        tr, te = _split_surface(pool[np.random.randint(len(pool))], nc, gr, n_heldout)
         train.append(tr)
         test.append(te)
     return train, test
