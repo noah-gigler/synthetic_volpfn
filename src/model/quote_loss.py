@@ -1,30 +1,46 @@
 # Quote loss (no true prices): -log P(bid <= y <= ask) at held-out quote locations
-# + calendar/butterfly hinges on the mean surface. Expects quote_data_preparation batches.
+# + calendar/butterfly penalties on a fresh random grid each call, à la
+# operator-deep-smoothing-for-implied-volatility's Loss.forward. Expects
+# quote_data_preparation batches (query = [random arb grid | held-out quote rows]).
 
+import numpy as np
 import torch
 
+from src.data_generation.grid import BUTTERFLY, CAL_LOW, CAL_HIGH
 
-def quote_arb_loss(estimator, batch, logits_BQL, *, grid_shape, lambda_cal=1.0,
+
+def _n_zb_nrc(cfg):
+    z_lim = (cfg["z"]["min"], cfg["z"]["max"])
+    rho_lim = (np.sqrt(cfg["ttm"]["min"]), np.sqrt(cfg["ttm"]["max"]))
+    n_zb = len(np.arange(z_lim[0], z_lim[1], 0.01))
+    n_rc = len(np.arange(rho_lim[0], rho_lim[1], 0.02))
+    return n_zb, n_rc
+
+
+def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=1.0,
                    lambda_bf=1.0, min_prob=1e-6, return_parts=False):
     # returns per-surface losses (G,) for a possibly grouped batch (G surfaces, E estimators).
-    # query = [arb lattice (first n_grid rows) | held-out quote rows]; arb reads the lattice,
-    # NLL reads the finite (held-out) rows.
+    n_zb, n_rc = _n_zb_nrc(cfg)
     BE, Q, _ = logits_BQL.shape
-    n_ttm, n_z = grid_shape
-    n_grid = n_ttm * n_z
-    assert Q >= n_grid, "query must hold the full arb lattice as its first n_grid rows"
-
     G = batch.y_query.shape[0]
     E = BE // G
     znorm_bardists = getattr(batch, "znorm_bardists", [batch.znorm_space_bardist] * G)
     raw_bardists = getattr(batch, "raw_bardists", [batch.raw_space_bardist] * G)
 
-    # (ρ, z) recovered from the lattice rows; feature col 0 is z directly (shared across ttm rows)
-    tau = batch.X_query_raw[0, :n_grid, 1].to(logits_BQL.device).reshape(n_ttm, n_z)
-    zz = batch.X_query_raw[0, :n_grid, 0].to(logits_BQL.device).reshape(n_ttm, n_z)
-    rho = torch.sqrt(tau[:, 0])                          # (n_ttm,)
-    zs = zz[0]                                           # (n_z,)
-    r_, z_ = rho.view(1, n_ttm, 1), zs.view(1, 1, n_z)
+    side_cpu = batch.X_query_raw[0, :, 2]
+    but_mask_cpu = side_cpu == BUTTERFLY
+    lo_mask_cpu, hi_mask_cpu = side_cpu == CAL_LOW, side_cpu == CAL_HIGH
+    but_mask, lo_mask, hi_mask = (m.to(logits_BQL.device) for m in (but_mask_cpu, lo_mask_cpu, hi_mask_cpu))
+    n_rb = int(but_mask.sum()) // n_zb
+    n_zc = int(lo_mask.sum()) // (n_rc - 1)
+
+    z_b = batch.X_query_raw[0, but_mask_cpu, 0].to(logits_BQL.device).reshape(n_rb, n_zb)[0]
+    tau_b = batch.X_query_raw[0, but_mask_cpu, 1].to(logits_BQL.device).reshape(n_rb, n_zb)[:, 0]
+    r_b = tau_b.sqrt().view(1, n_rb, 1)
+
+    tau_lo = batch.X_query_raw[0, lo_mask_cpu, 1].to(logits_BQL.device).reshape(n_rc - 1, n_zc)[:, 0]
+    tau_hi = batch.X_query_raw[0, hi_mask_cpu, 1].to(logits_BQL.device).reshape(n_rc - 1, n_zc)[:, 0]
+    r_lo, r_hi = tau_lo.sqrt().view(1, -1, 1), tau_hi.sqrt().view(1, -1, 1)
 
     losses, nlls, cals, bfs = [], [], [], []
     for g in range(G):
@@ -38,23 +54,22 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, grid_shape, lambda_cal=1.0,
         p_inside = (cdf[..., 1] - cdf[..., 0]).clamp_min(min_prob)
         nll = -torch.log(p_inside)[:, mask].mean()
 
-        # arbitrage hinges on the lattice rows, in (ρ, z) with w = iv^2 * tau
-        iv = raw_bardists[g].mean(logits[:, :n_grid]).clamp_min(1e-3).reshape(E, n_ttm, n_z)
-        w = iv**2 * tau
+        iv = raw_bardists[g].mean(logits).clamp_min(1e-3)
+        iv_b = iv[:, but_mask].reshape(E, n_rb, n_zb)
+        iv_lo = iv[:, lo_mask].reshape(E, n_rc - 1, n_zc)
+        iv_hi = iv[:, hi_mask].reshape(E, n_rc - 1, n_zc)
 
-        # calendar: dw/dtau|_k = (1/2ρ)[w_ρ - (z/ρ) w_z] >= 0   (ρ uniform -> clean stencil)
-        w_rho = torch.gradient(w, spacing=(rho,), dim=-2)[0]
-        w_z = torch.gradient(w, spacing=(zs,), dim=-1)[0]
-        # average over violating cells (helps clean up last arb points)
-        cal_v = torch.relu(-(w_rho - (z_ / r_) * w_z) / (2 * r_))
-        cal = cal_v.sum() / (cal_v > 0).sum().clamp_min(1)
+        # calendar: total variance must increase across maturities at fixed strike k
+        # (both slices already share k by construction, see grid.py sample_arb_grid)
+        cal = torch.relu(r_lo / r_hi - iv_hi / iv_lo.clamp_min(1e-3)).mean()
 
-        # butterfly: at fixed tau d/dk = (1/ρ)d/dz -> w_k=w_z/ρ, w_kk=w_zz/ρ^2, k=zρ; Gatheral g >= 0
-        w_zz = torch.gradient(w_z, spacing=(zs,), dim=-1)[0]
-        w_k, w_kk, k = w_z / r_, w_zz / r_**2, z_ * r_
+        # butterfly: w = iv^2 * tau; at fixed tau d/dk = (1/rho)d/dz -> Gatheral g >= 0
+        w = iv_b**2 * tau_b.view(1, n_rb, 1)
+        w_z = torch.gradient(w, spacing=(z_b,), dim=-1)[0]
+        w_zz = torch.gradient(w_z, spacing=(z_b,), dim=-1)[0]
+        w_k, w_kk, k = w_z / r_b, w_zz / r_b**2, z_b.view(1, 1, n_zb) * r_b
         g_fn = (1 - k * w_k / (2 * w)) ** 2 - w_k**2 / 4 * (1 / w + 0.25) + w_kk / 2
-        bf_v = torch.relu(-g_fn)
-        bf = bf_v.sum() / (bf_v > 0).sum().clamp_min(1)
+        bf = torch.relu(-g_fn).mean()
 
         losses.append(nll + lambda_cal * cal + lambda_bf * bf)
         nlls.append(nll)

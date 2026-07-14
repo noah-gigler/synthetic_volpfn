@@ -43,7 +43,7 @@ EVAL_SCHEMAS = {
     ),
     "noisy": dict(
         provider=lambda cfg, n, n_ctx, m: noisy_data_preparation(cfg, n, n_ctx, regime=m),
-        regimes=[0.5, 1, 2],
+        regimes=[0, 0.5, 1, 2],
     ),
 }
 
@@ -57,7 +57,7 @@ def _supervised_val(cfg):
 
 
 def _arb_val(cfg):
-    sets = [make_quote_eval_set(cfg, 8, s, N_HELDOUT) for s in VAL_CTX_SIZES]
+    sets = [make_quote_eval_set(cfg, GROUP_SIZE, s, N_HELDOUT, size_group=GROUP_SIZE) for s in VAL_CTX_SIZES]
     return sum((s[0] for s in sets), []), sum((s[1] for s in sets), [])
 
 
@@ -67,14 +67,14 @@ EXPERIMENTS = {
     "clean": dict(
         provider=lambda cfg, n_ctx: partial(data_preparation, cfg, n_context=n_ctx),
         val=_clean_val,
-        loss=lambda cfg, grid: None,
+        loss=lambda cfg: None,
         eval_schema="clean",
         group_size=1, batch_size=4,
     ),
     "supervised": dict(
         provider=lambda cfg, n_ctx: partial(noisy_data_preparation, cfg, n_context=n_ctx,  size_group=GROUP_SIZE),
         val=_supervised_val,
-        loss=lambda cfg, grid: None,
+        loss=lambda cfg: None,
         eval_schema="noisy",
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
     ),
@@ -82,7 +82,7 @@ EXPERIMENTS = {
         provider=lambda cfg, n_ctx: partial(
             quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE),
         val=_arb_val,
-        loss=lambda cfg, grid: partial(quote_arb_loss, grid_shape=grid, lambda_cal=1.0, lambda_bf=1.0),
+        loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=1.0, lambda_bf=1.0),
         eval_schema="noisy",
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
     ),
@@ -152,7 +152,7 @@ def _baselines(eval_set, cfg):
                 # feature col 0 is z; SSVI fits/predicts in physical strike k
                 X2_k = np.column_stack([z_to_k(X2[:, 0], X2[:, 1]), X2[:, 1]])
                 params, _ = fit_ssvi(X2_k, mq, cfg, weights=w)
-                pred = predict_ssvi(params, g.ttms, g.k.reshape(g.shape)).ravel()
+                pred = predict_ssvi(params, g.ttms[:, None], g.k.reshape(g.shape)).ravel()
                 wls.append(np.mean(np.abs(pred - yq)))
                 wls_mape.append(np.mean(np.abs((yq - pred) / yq)) * 100)
                 idx = [np.where((Xq[:, 0] == X2[i, 0]) & (Xq[:, 1] == X2[i, 1]))[0][0]
@@ -242,7 +242,7 @@ def main():
     if not args.eval_only:
         val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val)
         data_provider = spec["provider"](cfg, tuple(args.n_context))
-        loss_fn = spec["loss"](cfg, Grid(cfg).shape)
+        loss_fn = spec["loss"](cfg)
         finetune(
             data_provider, run_name=run_name, n_epochs=args.epochs,
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size or spec["batch_size"],

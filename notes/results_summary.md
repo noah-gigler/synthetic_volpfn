@@ -1,4 +1,4 @@
-# Results summary (as of 2026-07-07)
+# Results summary (as of 2026-07-14)
 
 Chronology of finetuning experiments and what each established. Checkpoints in `checkpoints/<run>/`;
 all evals on synthetic SSVI surfaces from the `config.yaml` prior, MAE vs the clean truth on the
@@ -109,15 +109,87 @@ full 15x25 grid unless stated otherwise.
     Flip side: away from the edge the quote model respects spreads *better* than the supervised
     one (99.2% vs 91.3% at n=50, worst surface 96% vs 58%) — direct interval training pays.
 
-## Known issue
+## Real-data experiments (SPXW EOD 2023, 2026-07-13/14)
 
-**Stale-kernel eval artifact**: long-lived Jupyter kernels produced 10-50x-worse MAE at specific
-(model, context-size) slots (e.g. noisyFT@60quotes = 0.037-0.050 in-kernel vs 0.0034 fresh),
-consistent within a session, moving between sessions, never reproducible in a fresh process.
-A within-process ordering experiment (same slot before/after a sweep-like history) showed *no*
-effect, so a simple shape-keyed cache is ruled out; root cause unknown. Mitigation: restart the
-kernel before evals, or run sweep slots in subprocesses. Do not trust in-kernel sweep numbers that
-contradict training-val values.
+First runs on real market quotes. Data: `datasets/processed/spxw.parquet` (248 EOD SPXW surfaces,
+2023, one 16:14 ET snapshot/day, ~5-6k OTM quotes each; built by `src/real_data/preprocess_surfaces.py`
+from the Databento pipeline). Dataloader `src/real_data/dataloader.py`: temporal train/val/test split
+(163/22/63 days), ATM-weighted context sampling, `build_task`/`make_real_eval_set` emit the
+`quote_data_preparation` contract so the quote/arb loss + `finetune` run unchanged. No true IV exists
+on real data, so MAE is vs the **market mid** (a noisy proxy), and checkpoint selection stays truth-free.
+
+**Metric note:** `check_arbitrage` returns `.any()` per surface, so reported "arb %" = fraction of
+surfaces with **>=1** violating cell, *not* fraction of cells.
+
+### Runs
+
+| run | config | outcome |
+|---|---|---|
+| `real_v1` | mean reduction, lambda=1 (arb ~off), 50ep, coarse grid | MAE 0.90% @N40, inside 29.8% — best fit but **~50% fine-grid arb: unusable surface** |
+| `real_v2` | violators, lambda=100, 50ep | over-regularized: MAE 2.10%, std inflated |
+| `real_v3` | violators, lambda=10, 150ep, **coarse** grid | MAE 1.79% looks great but **~50% arb on the honest fine grid** (coarse-trained) |
+| `real_v4_curv{5,20,50}` | fine jittered grid + curvature, 50ep | curvature marginal (see finding 16) |
+| `real_v5_bf10_c0` | fine jittered grid, violators, lambda_bf=10, 150ep | **winner**: MAE 1.88% @N40, ~5% fine-grid arb, beats SSVI at N>=10 |
+| `real_v5_bf10_c5` / `bf3_c0` | +curvature / lambda_bf=3 | c5 over-smooths (inside 12%); bf3 arb rebounds to ~9% |
+
+Headline comparison @N=40, honest fine grid (MAE/inside at held quotes, grid-independent):
+
+| model | MAE% | inside% | fine-grid arb bf% |
+|---|---|---|---|
+| SSVI oracle | 2.38 | 8.1 | 0 (by constr.) |
+| **v5 bf10_c0** | **1.88** | 24.7 | **~5** |
+| v5 bf3_c0 | 1.71 | 26.1 | ~9 |
+| v5 bf10_c5 | 2.15 | 12.2 | ~3.6 |
+| v1 (arb off) | 0.90 | 29.8 | **~50** |
+
+### Established findings
+
+13. **The coarse 15x25 arb grid is falsely optimistic — violations don't converge.** Evaluating a
+    fixed surface at 1x/2x/3x/4x resolution: incidence 6% -> 62% -> 100% -> 100%, violating-cell
+    count grows ~proportionally to grid size (constant *fraction* of cells non-convex at every scale).
+    TabPFN predicts each (z,tau) quasi-independently, so the surface is wiggly at all scales and a
+    coarse grid steps over most of it. Real SPXW has ~50-100 strikes/expiry -> the honest grid is
+    ~2-3x; at that density the coarse "clean" models are ~50% violating. **Measure arb on the fine
+    grid.**
+14. **Violators reduction >> mean.** Penalizing mean violation *depth over violating cells only*
+    (`v.sum()/(v>0).sum()`) beats averaging over the whole lattice: at equal lambda it cuts arb ~3x
+    for near-zero NLL cost; to match it, `mean` needs ~100-1000x larger lambda and pays more NLL.
+    `mean` dilutes the gradient and vanishes as violations get rare (teaches-to-the-grid). Now the
+    **only** reduction in `quote_arb_loss` (the param was removed).
+15. **Fine + jittered grid is the real fix.** Training the penalty on a 2x grid whose axis nodes are
+    re-jittered each epoch (stochastic collocation — prevents teaching-to-the-grid; `Grid(..., jitter=)`)
+    drops honest fine-grid arb from **~50% (v3, coarse-trained) to ~5% (v5)** while holding MAE. Jitter
+    can only move whole axis slices (the finite-difference stencil needs a rectangular lattice), so it
+    perturbs the `zs`/`rho` axis vectors, not individual nodes.
+16. **Curvature penalty removed — marginal and costly.** A `mean(w_zz^2)` roughness prior traded ~1%
+    arb for ~0.3% MAE (and craters inside-spread 25%->12%). Not worth it; deleted from the code.
+17. **lambda_bf=10 is right.** bf=3 too weak (arb rebounds to ~9%); bf=100 over-regularizes (MAE
+    doubles, std inflates). bf=10 gives ~5% arb at MAE 1.88%.
+18. **Full anneal matters for the fine-grid objective.** Unlike the coarse/synthetic runs (val flat by
+    ~epoch 30), the harder fine-grid arb objective was still improving at epoch 50 — 150 epochs
+    improved both MAE and arb. Data is the ceiling (163-day pool; val saturates ~epoch 30 only for the
+    easy objective).
+19. **HEADLINE — arb is nearly free in *true* accuracy; the real-data MAE "regression" is
+    noise-overfitting, not lost accuracy.** Synthetic truth validation (`synth_val.py`, 40ep, true IV
+    known), true-MAE %:
+
+    | N | quote_arb (bf=10) | quote_noarb (bf=0) | supervised |
+    |---|---|---|---|
+    | 5 | 3.76 | 3.52 | 2.93 |
+    | 20 | 1.30 | 1.17 | 0.89 |
+    | 40 | 1.00 | 0.94 | 0.64 |
+
+    arb: quote_arb **0% at all N**; quote_noarb and even **supervised** violate (6-12%). So (a)
+    enforcing arb costs only ~0.06-0.24% *true*-MAE while eliminating violations — the v1 0.9%->1.9%
+    real gap is the model correctly *shedding noisy-mid overfitting*, not losing real accuracy; (b)
+    **only the arb penalty gives arb-free surfaces — supervision alone does not**; (c) the real,
+    unavoidable gap is truth-free vs supervised (~0.3% @N40, grows with context) = the cost of interval
+    censoring, and it's an *unreachable* ceiling (no true-IV label exists in the market; training on
+    mids = v1 = overfitting). Possible partial recovery: exploit bid/ask **size**/microstructure to
+    sharpen the interval likelihood (open item).
+
+**Working model: `real_v5_bf10_c0`** — arb-free (~5% fine-grid) at true-MAE near the truth-free ceiling,
+beats the SSVI oracle at N>=10.
 
 ## Open items
 
@@ -134,3 +206,9 @@ contradict training-val values.
 - Quote-loss watch item: interval NLL alone leaves within-spread location underdetermined at
   quote points; overlapping quotes + arb + prior pinned it here, revisit if real data behaves
   differently (fallback: margin/quantile-outside penalty).
+- (real data) More trading days: 163-day 2023 pool is the ceiling (val saturates ~epoch 30). Pull
+  2020-22/2024 EOD SPXW to grow it — the only lever that moves MAE *and* arb together (Databento cost).
+- (real data) Microstructure interval likelihood: bid/ask *size* / traded side may carry where the
+  true IV sits in the spread — could recover part of the ~0.3% truth-free-vs-supervised gap (finding 19).
+- (real data) Sparse regime (N=5) is worst on both MAE and arb; targeted hard-day/small-context
+  emphasis before spending on more data.

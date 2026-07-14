@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from src.data_generation.data_preperation import sample_context_sizes
+from src.data_generation.grid import sample_arb_grid
 from src.data_generation.noise import BID, ASK, TRUE
 
 REPO = Path(__file__).resolve().parents[2]
@@ -31,7 +32,7 @@ def temporal_split(start, end=None, val_months=1, test_months=3):
     return train, val, test
 
 
-def _split_surface(s, nc, grid=None, n_heldout=None):
+def _split_surface(s, nc, arb_rows=None, n_heldout=None):
     z, tau = s["z"].values, s["tau"].values
     bid, ask = s["bid_iv"].values, s["ask_iv"].values
 
@@ -47,32 +48,33 @@ def _split_surface(s, nc, grid=None, n_heldout=None):
 
     held_rows = np.column_stack([z[held], tau[held], np.full(len(held), TRUE)])
     y_held = np.column_stack([bid[held], ask[held]])
-    if grid is None:
+    if arb_rows is None:
         return (X_train, y_train), (held_rows, y_held)
 
-    grid_rows = np.column_stack([grid.z, grid.tau, np.full(len(grid.z), TRUE)])
-    X_test = np.vstack([grid_rows, held_rows])            # arb lattice first, then held-out quotes
+    X_test = np.vstack([arb_rows, held_rows])             # arb grid first, then held-out quotes
     y_test = np.full((len(X_test), 2), np.nan)
-    y_test[len(grid_rows):] = y_held
+    y_test[len(arb_rows):] = y_held
     return (X_train, y_train), (X_test, y_test)
 
 
-def build_task(pool, n, n_context, grid=None, n_heldout=None, size_group=1):
-    gr = grid() if callable(grid) else grid    # callable -> fresh (e.g. jittered) grid per call
+def build_task(pool, n, n_context, cfg=None, n_heldout=None, size_group=1):
     sizes = sample_context_sizes(n_context, n, group=size_group)
     train, test = [], []
-    for nc in sizes:
-        tr, te = _split_surface(pool[np.random.randint(len(pool))], nc, gr, n_heldout)
-        train.append(tr)
-        test.append(te)
+    for start in range(0, n, size_group):
+        arb_rows = sample_arb_grid(cfg)[0] if cfg is not None else None
+        for nc in sizes[start:start + size_group]:
+            tr, te = _split_surface(pool[np.random.randint(len(pool))], nc, arb_rows, n_heldout)
+            train.append(tr)
+            test.append(te)
     return train, test
 
 
-def make_real_eval_set(pool, sizes, grid=None, n_heldout=None):
+def make_real_eval_set(pool, sizes, cfg=None, n_heldout=None):
     train, test = [], []
     for size in sizes:
+        arb_rows = sample_arb_grid(cfg)[0] if cfg is not None else None
         for s in pool:
-            tr, te = _split_surface(s, size, grid, n_heldout)
+            tr, te = _split_surface(s, size, arb_rows, n_heldout)
             train.append(tr)
             test.append(te)
     return train, test
