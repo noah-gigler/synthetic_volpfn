@@ -34,6 +34,9 @@ def half_spread(k, tau, sigma, noise_cfg, regime=1.0):
 
 
 def add_quote_noise(k, tau, sigma_true, noise_cfg, regime=1.0):
+    if regime == 0:
+        return sigma_true, sigma_true
+
     # true IV at a uniform random position inside the spread
     s = half_spread(k, tau, sigma_true, noise_cfg, regime)
     u = np.random.uniform(0, 1, np.shape(sigma_true))
