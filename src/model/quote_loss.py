@@ -17,8 +17,8 @@ def _n_zb_nrc(cfg):
     return n_zb, n_rc
 
 
-def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=1.0,
-                   lambda_bf=1.0, min_prob=1e-6, return_parts=False):
+def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
+                   lambda_bf=10.0, min_prob=1e-6, return_parts=False):
     # returns per-surface losses (G,) for a possibly grouped batch (G surfaces, E estimators).
     n_zb, n_rc = _n_zb_nrc(cfg)
     BE, Q, _ = logits_BQL.shape
