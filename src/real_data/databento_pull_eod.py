@@ -7,6 +7,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import databento as db
+from databento.common.error import BentoServerError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +25,8 @@ EOD_END = time(16, 15)
 WINDOW = "eod"  # manifest cost key: (date, window, schema)
 
 SLEEP_S = 2.0
+MAX_RETRIES = 6
+RETRY_BASE_S = 5.0
 
 REPO = Path(__file__).resolve().parents[2]
 OUT_DIR = REPO / "datasets" / "raw" / "spxw"
@@ -95,8 +98,17 @@ for d, est in to_pull:
     kw = dict(dataset=DATASET, symbols=SYMBOLS, stype_in="parent", schema=SCHEMA, start=start, end=end)
     out = OUT_DIR / f"{d.isoformat()}.dbn.zst"
 
-    store = client.timeseries.get_range(**kw)
-    store.to_file(out)
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            store = client.timeseries.get_range(**kw)
+            store.to_file(out)
+            break
+        except BentoServerError:
+            if attempt == MAX_RETRIES:
+                raise
+            wait = RETRY_BASE_S * 2**attempt
+            print(f"{d}  server error, retrying in {wait:.0f}s ({attempt + 1}/{MAX_RETRIES})")
+            time_mod.sleep(wait)
 
     size = out.stat().st_size
     row = manifest[(d.isoformat(), WINDOW, SCHEMA)]
