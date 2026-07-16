@@ -27,7 +27,7 @@ VAL_DIR = DATA_DIR / "val"
 EVAL_DIR = DATA_DIR / "eval"
 VAL_SEED = 0
 EVAL_SEED = 1
-N_HELDOUT = 15
+N_HELDOUT = 315
 EVAL_N = 512
 VAL_CTX_SIZES = [5, 10, 20, 40, 60]
 EVAL_CTX_SIZES = [3, 5, 10, 20, 40, 60]
@@ -71,7 +71,7 @@ EXPERIMENTS = {
         provider=lambda cfg, n_ctx: partial(
             quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE),
         val=_arb_val,
-        loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=1.0, lambda_bf=1.0),
+        loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0, lambda_reg_z=0.01, lambda_reg_r=0.01),
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=GROUP_SIZE,
     ),
 }
