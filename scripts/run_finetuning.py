@@ -9,9 +9,6 @@ import torch
 import yaml
 from tabpfn import TabPFNRegressor
 
-from src.data_generation.data_preperation import (
-    data_preparation, make_stratified_eval_set,
-)
 from src.data_generation.grid import Grid, z_to_k
 from src.data_generation.noise import (
     make_noisy_stratified_eval_set, make_quote_eval_set,
@@ -33,23 +30,7 @@ EVAL_N = 50
 VAL_CTX_SIZES = [5, 10, 20, 40, 60]
 EVAL_CTX_SIZES = [3, 5, 10, 20, 40, 60]
 
-# eval sets are frozen per schema and shared across every model with that schema, so
-# their tables are row-aligned and combinable. surfaces are seeded per n_ctx only, so
-# clean and noisy schemas share the same underlying truth (differing only in context).
-EVAL_SCHEMAS = {
-    "clean": dict(
-        provider=lambda cfg, n, n_ctx, m: data_preparation(cfg, n, n_ctx),
-        regimes=[None],
-    ),
-    "noisy": dict(
-        provider=lambda cfg, n, n_ctx, m: noisy_data_preparation(cfg, n, n_ctx, regime=m),
-        regimes=[0, 0.5, 1, 2],
-    ),
-}
-
-
-def _clean_val(cfg):
-    return make_stratified_eval_set(cfg, 20, VAL_CTX_SIZES)
+EVAL_REGIMES = [0, 0.5, 1, 2]
 
 
 def _supervised_val(cfg):
@@ -64,18 +45,10 @@ def _arb_val(cfg):
 GROUP_SIZE = 8
 BATCH_SIZE = 32
 EXPERIMENTS = {
-    "clean": dict(
-        provider=lambda cfg, n_ctx: partial(data_preparation, cfg, n_context=n_ctx),
-        val=_clean_val,
-        loss=lambda cfg: None,
-        eval_schema="clean",
-        group_size=1, batch_size=4,
-    ),
     "supervised": dict(
         provider=lambda cfg, n_ctx: partial(noisy_data_preparation, cfg, n_context=n_ctx,  size_group=GROUP_SIZE),
         val=_supervised_val,
         loss=lambda cfg: None,
-        eval_schema="noisy",
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
     ),
     "arb": dict(
@@ -83,24 +56,24 @@ EXPERIMENTS = {
             quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE),
         val=_arb_val,
         loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=1.0, lambda_bf=1.0),
-        eval_schema="noisy",
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
     ),
 }
 
 
-def load_eval(schema, cfg, rebuild=False):
+def load_eval(cfg, rebuild=False):
+    # frozen eval set, shared across every experiment (both train on the noisy/bid-ask
+    # schema); surfaces are seeded per n_ctx only, so it's reused as-is across models.
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    path = EVAL_DIR / f"{schema}.pkl"
+    path = EVAL_DIR / "noisy.pkl"
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
-    spec = EVAL_SCHEMAS[schema]
     eval_set = {}
-    for m in spec["regimes"]:
+    for m in EVAL_REGIMES:
         eval_set[m] = {}
         for n_ctx in EVAL_CTX_SIZES:
-            np.random.seed(EVAL_SEED * 1000 + n_ctx)  # per-n_ctx -> same truth across schemas/regimes
-            eval_set[m][n_ctx] = spec["provider"](cfg, EVAL_N, n_ctx, m)
+            np.random.seed(EVAL_SEED * 1000 + n_ctx)  # per-n_ctx -> same truth across regimes
+            eval_set[m][n_ctx] = noisy_data_preparation(cfg, EVAL_N, n_ctx, regime=m)
     pickle.dump(eval_set, open(path, "wb"))
     return eval_set
 
@@ -137,15 +110,12 @@ def _split_quotes(train):
 
 
 def _baselines(eval_set, cfg):
-    # model-independent MAE baselines on the noisy eval set; needs bid/ask quotes so
-    # returns None for the clean schema
+    # model-independent MAE baselines on the noisy eval set (needs bid/ask quotes)
     g = Grid(cfg)
     out = {}
     for m, by_ctx in eval_set.items():
         rows = {}
         for n_ctx, (tr, te) in by_ctx.items():
-            if tr[0][0].shape[1] < 3:                  # clean context, no spread
-                return None
             wls, wls_mape, mid = [], [], []
             for (X2, mq, s), (Xq, yq) in zip(_split_quotes(tr), te):
                 w = 1 / np.maximum(2 * mq * X2[:, 1] * s, 1e-10)
@@ -165,14 +135,13 @@ def _baselines(eval_set, cfg):
     return out
 
 
-def load_baselines(schema, cfg, eval_set, rebuild=False):
-    path = EVAL_DIR / f"{schema}_baselines.json"
+def load_baselines(cfg, eval_set, rebuild=False):
+    path = EVAL_DIR / "noisy_baselines.json"
     if path.exists() and not rebuild:
         raw = json.load(open(path))
         return {float(m): {int(n): v for n, v in rows.items()} for m, rows in raw.items()}
     base = _baselines(eval_set, cfg)
-    if base is not None:
-        json.dump(base, open(path, "w"), indent=2, default=str)
+    json.dump(base, open(path, "w"), indent=2, default=str)
     return base
 
 
@@ -181,16 +150,11 @@ def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines)
 
     for m, rows in results.items():
         lines.append(f"\n=== regime m={m} ===")
-        if baselines is not None:
-            lines.append(f"{'n_ctx':>6} {'FT MAE':>8} {'SSVI MAE':>9} {'FT MAPE%':>9} {'SSVI MAPE%':>11}")
-            for n_ctx, r in rows.items():
-                b = baselines[float(m)][int(n_ctx)]
-                lines.append(f"{n_ctx:>6} {r['mae']:>8.4f} {b['refit_wls']:>9.4f}"
-                             f" {r['mape']:>9.2f} {b['refit_wls_mape']:>11.2f}")
-        else:
-            lines.append(f"{'n_ctx':>6} {'FT MAE':>8} {'FT MAPE%':>9}")
-            for n_ctx, r in rows.items():
-                lines.append(f"{n_ctx:>6} {r['mae']:>8.4f} {r['mape']:>9.2f}")
+        lines.append(f"{'n_ctx':>6} {'FT MAE':>8} {'SSVI MAE':>9} {'FT MAPE%':>9} {'SSVI MAPE%':>11}")
+        for n_ctx, r in rows.items():
+            b = baselines[float(m)][int(n_ctx)]
+            lines.append(f"{n_ctx:>6} {r['mae']:>8.4f} {b['refit_wls']:>9.4f}"
+                         f" {r['mape']:>9.2f} {b['refit_wls_mape']:>11.2f}")
 
     lines.append("\n\nArbitrage")
     for m, rows in arb_results.items():
@@ -203,9 +167,8 @@ def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines)
     open(path, "w").write("\n".join(lines) + "\n")
 
 
-def run_eval(experiment, run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0):
-    spec = EXPERIMENTS[experiment]
-    eval_set = load_eval(spec["eval_schema"], cfg, rebuild=rebuild_eval)
+def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0):
+    eval_set = load_eval(cfg, rebuild=rebuild_eval)
     model, state = load_finetuned(run_name, device, which=which)
     results, arb_results = {}, {}
     slots = [(m, n_ctx) for m, by_ctx in eval_set.items() for n_ctx in by_ctx]
@@ -221,7 +184,7 @@ def run_eval(experiment, run_name, cfg, device, rebuild_eval=False, which="final
             cell_frac=float(cell_frac), mean_depth=float(mean_depth),
             worst_cell=float(worst_cell), arb_free=float(arb_free))
 
-    baselines = load_baselines(spec["eval_schema"], cfg, eval_set, rebuild=rebuild_eval)
+    baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval)
 
     out_dir = ROOT / "checkpoints" / run_name
     json.dump(dict(mae=results, arb=arb_results), open(out_dir / "eval.json", "w"), indent=2)
@@ -261,7 +224,7 @@ def main():
             loss_fn=loss_fn, device=args.device,
         )
 
-    run_eval(args.experiment, run_name, cfg, args.device, rebuild_eval=args.rebuild_eval)
+    run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval)
 
 
 if __name__ == "__main__":
