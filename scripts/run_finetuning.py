@@ -33,13 +33,27 @@ EVAL_CTX_SIZES = [3, 5, 10, 20, 40, 60]
 EVAL_REGIMES = [0, 0.5, 1, 2]
 
 
+def _split_by_regime(build, n_total):
+    # n_total surfaces split into equal chunks across EVAL_REGIMES, so val is stratified
+    # by noise regime instead of a single random draw
+    n = n_total // len(EVAL_REGIMES)
+    train, test = [], []
+    for m in EVAL_REGIMES:
+        tr, te = build(n, m)
+        train += tr
+        test += te
+    return train, test
+
+
 def _supervised_val(cfg):
-    return make_noisy_stratified_eval_set(cfg, 20, VAL_CTX_SIZES)
+    return _split_by_regime(lambda n, m: make_noisy_stratified_eval_set(cfg, n, VAL_CTX_SIZES, regime=m), 20)
 
 
 def _arb_val(cfg):
-    sets = [make_quote_eval_set(cfg, GROUP_SIZE, s, N_HELDOUT, size_group=GROUP_SIZE) for s in VAL_CTX_SIZES]
-    return sum((s[0] for s in sets), []), sum((s[1] for s in sets), [])
+    def build(n, m):
+        sets = [make_quote_eval_set(cfg, n, s, N_HELDOUT, regime=m, size_group=GROUP_SIZE) for s in VAL_CTX_SIZES]
+        return sum((s[0] for s in sets), []), sum((s[1] for s in sets), [])
+    return _split_by_regime(build, GROUP_SIZE)
 
 
 GROUP_SIZE = 8
