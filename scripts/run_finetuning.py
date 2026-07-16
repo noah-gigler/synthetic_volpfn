@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import pickle
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from pathlib import Path
 
@@ -9,7 +11,7 @@ import torch
 import yaml
 from tabpfn import TabPFNRegressor
 
-from src.data_generation.grid import Grid, z_to_k
+from src.data_generation.grid import Grid, sample_arb_grid, z_to_k
 from src.data_generation.noise import (
     make_noisy_stratified_eval_set, make_quote_eval_set,
     noisy_data_preparation, quote_data_preparation,
@@ -26,7 +28,7 @@ EVAL_DIR = DATA_DIR / "eval"
 VAL_SEED = 0
 EVAL_SEED = 1
 N_HELDOUT = 15
-EVAL_N = 50
+EVAL_N = 512
 VAL_CTX_SIZES = [5, 10, 20, 40, 60]
 EVAL_CTX_SIZES = [3, 5, 10, 20, 40, 60]
 
@@ -92,6 +94,19 @@ def load_eval(cfg, rebuild=False):
     return eval_set
 
 
+def load_arb_grid(cfg, rebuild=False):
+    # frozen once (same grid reused across every checkpoint's arb eval), unlike training's
+    # per-surface random grid -> every surface shares the same query shape and can be batched
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    path = EVAL_DIR / "arb_grid.pkl"
+    if path.exists() and not rebuild:
+        return pickle.load(open(path, "rb"))
+    np.random.seed(EVAL_SEED)
+    rows = sample_arb_grid(cfg, jitter=True, r_b_step_range=(0.019, 0.025))
+    pickle.dump(rows, open(path, "wb"))
+    return rows
+
+
 def load_val(experiment, cfg, rebuild=False):
     VAL_DIR.mkdir(parents=True, exist_ok=True)
     path = VAL_DIR / f"{experiment}.pkl"
@@ -123,38 +138,54 @@ def _split_quotes(train):
     return out
 
 
-def _baselines(eval_set, cfg):
-    # model-independent MAE baselines on the noisy eval set (needs bid/ask quotes)
-    g = Grid(cfg)
-    out = {}
+def _baseline_one(args):
+    # one surface's SSVI refit; top-level (not a closure) so it's picklable for ProcessPoolExecutor
+    (X2, mq, s), (Xq, yq), cfg_dict = args
+    g = Grid(cfg_dict)
+    w = 1 / np.maximum(2 * mq * X2[:, 1] * s, 1e-10)
+    # feature col 0 is z; SSVI fits/predicts in physical strike k
+    X2_k = np.column_stack([z_to_k(X2[:, 0], X2[:, 1]), X2[:, 1]])
+    params, _ = fit_ssvi(X2_k, mq, cfg_dict, weights=w)
+    pred = predict_ssvi(params, g.ttms[:, None], g.k.reshape(g.shape)).ravel()
+    wls = np.mean(np.abs(pred - yq))
+    wls_mape = np.mean(np.abs((yq - pred) / yq)) * 100
+    idx = [np.where((Xq[:, 0] == X2[i, 0]) & (Xq[:, 1] == X2[i, 1]))[0][0] for i in range(len(mq))]
+    mid = np.abs(mq - yq[idx]).mean()
+    return wls, wls_mape, mid
+
+
+def _baselines(eval_set, cfg, n_jobs=None):
+    # model-independent MAE baselines on the noisy eval set (needs bid/ask quotes); the SSVI
+    # refit is CPU-only and independent per surface, so it's dispatched across processes -
+    # doesn't touch the GPU at all, can run on a separate CPU-heavy allocation from the eval passes
+    n_jobs = n_jobs or os.cpu_count()
+    jobs = []
+    slot_sizes = []
     for m, by_ctx in eval_set.items():
-        rows = {}
         for n_ctx, (tr, te) in by_ctx.items():
-            wls, wls_mape, mid = [], [], []
-            for (X2, mq, s), (Xq, yq) in zip(_split_quotes(tr), te):
-                w = 1 / np.maximum(2 * mq * X2[:, 1] * s, 1e-10)
-                # feature col 0 is z; SSVI fits/predicts in physical strike k
-                X2_k = np.column_stack([z_to_k(X2[:, 0], X2[:, 1]), X2[:, 1]])
-                params, _ = fit_ssvi(X2_k, mq, cfg, weights=w)
-                pred = predict_ssvi(params, g.ttms[:, None], g.k.reshape(g.shape)).ravel()
-                wls.append(np.mean(np.abs(pred - yq)))
-                wls_mape.append(np.mean(np.abs((yq - pred) / yq)) * 100)
-                idx = [np.where((Xq[:, 0] == X2[i, 0]) & (Xq[:, 1] == X2[i, 1]))[0][0]
-                       for i in range(len(mq))]
-                mid.append(np.abs(mq - yq[idx]).mean())
-            rows[n_ctx] = dict(refit_wls=float(np.mean(wls)),
-                               refit_wls_mape=float(np.mean(wls_mape)),
-                               mid=float(np.mean(mid)))
-        out[m] = rows
+            quotes = _split_quotes(tr)
+            jobs += [(q, t, cfg) for q, t in zip(quotes, te)]
+            slot_sizes.append((m, n_ctx, len(quotes)))
+
+    with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+        results = list(ex.map(_baseline_one, jobs, chunksize=4))
+
+    out = {}
+    pos = 0
+    for m, n_ctx, n in slot_sizes:
+        wls, wls_mape, mid = zip(*results[pos:pos + n])
+        pos += n
+        out.setdefault(m, {})[n_ctx] = dict(
+            refit_wls=float(np.mean(wls)), refit_wls_mape=float(np.mean(wls_mape)), mid=float(np.mean(mid)))
     return out
 
 
-def load_baselines(cfg, eval_set, rebuild=False):
+def load_baselines(cfg, eval_set, rebuild=False, n_jobs=None):
     path = EVAL_DIR / "noisy_baselines.json"
     if path.exists() and not rebuild:
         raw = json.load(open(path))
         return {float(m): {int(n): v for n, v in rows.items()} for m, rows in raw.items()}
-    base = _baselines(eval_set, cfg)
+    base = _baselines(eval_set, cfg, n_jobs=n_jobs)
     json.dump(base, open(path, "w"), indent=2, default=str)
     return base
 
@@ -181,8 +212,9 @@ def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines)
     open(path, "w").write("\n".join(lines) + "\n")
 
 
-def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0):
+def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, baseline_jobs=None):
     eval_set = load_eval(cfg, rebuild=rebuild_eval)
+    arb_rows = load_arb_grid(cfg, rebuild=rebuild_eval)
     model, state = load_finetuned(run_name, device, which=which)
     results, arb_results = {}, {}
     slots = [(m, n_ctx) for m, by_ctx in eval_set.items() for n_ctx in by_ctx]
@@ -193,12 +225,13 @@ def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0):
         results.setdefault(str(m), {})[n_ctx] = dict(
             mae=float(mae), mape=float(mape), cal_viol=float(cal), bf_viol=float(bf))
 
-        cell_frac, mean_depth, worst_cell, arb_free = eval_arbitrage_fine(model, tr, cfg, reload_state=state)
+        cell_frac, mean_depth, worst_cell, arb_free = eval_arbitrage_fine(
+            model, tr, cfg, arb_rows, reload_state=state)
         arb_results.setdefault(str(m), {})[n_ctx] = dict(
             cell_frac=float(cell_frac), mean_depth=float(mean_depth),
             worst_cell=float(worst_cell), arb_free=float(arb_free))
 
-    baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval)
+    baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval, n_jobs=baseline_jobs)
 
     out_dir = ROOT / "checkpoints" / run_name
     json.dump(dict(mae=results, arb=arb_results), open(out_dir / "eval.json", "w"), indent=2)
@@ -221,6 +254,8 @@ def main():
     p.add_argument("--rebuild-val", action="store_true")
     p.add_argument("--rebuild-eval", action="store_true")
     p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--baseline-jobs", type=int, default=None,
+                    help="CPU workers for the SSVI baseline refit (default: os.cpu_count())")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
@@ -238,7 +273,7 @@ def main():
             val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
         )
 
-    run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval)
+    run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval, baseline_jobs=args.baseline_jobs)
 
 
 if __name__ == "__main__":
