@@ -77,7 +77,7 @@ def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
     return check_arbitrage(iv_flat.reshape(g.shape), g.ttms, g.zs, tol=tol)
 
 
-def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=16):
+def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128):
     # `model` is ignored except as an API anchor; a shared batched estimator does the work.
     # reload_state=None evaluates the non-finetuned pretrained weights.
     est = _get_eval_estimator()
