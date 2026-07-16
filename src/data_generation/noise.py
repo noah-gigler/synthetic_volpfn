@@ -91,7 +91,8 @@ def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None, 
     return _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg, rho)
 
 
-def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", regime=None, size_group=1, rho=0.0):
+def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", regime=None, size_group=1, rho=0.0,
+                            arb_grid_jitter=False):
     # decoupled query: [random arb grid (y=NaN, fresh every size_group chunk)] ++
     # [n_heldout quote rows (y=[bid,ask])]. True prices appear nowhere.
     noise_cfg = cfg["noise"]
@@ -102,7 +103,7 @@ def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", re
 
     train, test = [], []
     for start in range(0, n, size_group):
-        arb_rows, _, _ = sample_arb_grid(cfg)
+        arb_rows = sample_arb_grid(cfg, jitter=arb_grid_jitter)
         n_arb = len(arb_rows)
         for i in range(start, min(start + size_group, n)):
             sigma = surfaces[i].ravel()
