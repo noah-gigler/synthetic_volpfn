@@ -124,6 +124,7 @@ def finetune(
     n_surfaces_per_epoch: int = 200,
     batch_size: int = 1,
     group_size: int = 1,
+    val_group_size: int | None = None,
     n_val_surfaces: int = 5,
     val_data: tuple[list, list] | None = None,
     val_every: int = 1,
@@ -190,7 +191,8 @@ def finetune(
 
     val_surfaces = None
     if val_train is not None:
-        val_surfaces = preprocess_surfaces(estimator, val_train, val_test, rng, group_size=group_size)
+        val_surfaces = preprocess_surfaces(
+            estimator, val_train, val_test, rng, group_size=val_group_size or group_size)
         val_sizes = [len(y_ctx) for _, y_ctx in val_train]
 
     log.info(

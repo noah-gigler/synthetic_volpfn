@@ -46,14 +46,14 @@ def _split_by_regime(build, n_total):
 
 
 def _supervised_val(cfg):
-    return _split_by_regime(lambda n, m: make_noisy_stratified_eval_set(cfg, n, VAL_CTX_SIZES, regime=m), 20)
+    return _split_by_regime(lambda n, m: make_noisy_stratified_eval_set(cfg, n, VAL_CTX_SIZES, regime=m), 128)
 
 
 def _arb_val(cfg):
     def build(n, m):
         sets = [make_quote_eval_set(cfg, n, s, N_HELDOUT, regime=m, size_group=GROUP_SIZE) for s in VAL_CTX_SIZES]
         return sum((s[0] for s in sets), []), sum((s[1] for s in sets), [])
-    return _split_by_regime(build, GROUP_SIZE)
+    return _split_by_regime(build, 128)
 
 
 GROUP_SIZE = 8
@@ -63,14 +63,14 @@ EXPERIMENTS = {
         provider=lambda cfg, n_ctx: partial(noisy_data_preparation, cfg, n_context=n_ctx,  size_group=GROUP_SIZE),
         val=_supervised_val,
         loss=lambda cfg: None,
-        group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
+        group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=128,
     ),
     "arb": dict(
         provider=lambda cfg, n_ctx: partial(
             quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE),
         val=_arb_val,
         loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=1.0, lambda_bf=1.0),
-        group_size=GROUP_SIZE, batch_size=BATCH_SIZE,
+        group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=GROUP_SIZE,
     ),
 }
 
@@ -234,8 +234,8 @@ def main():
         finetune(
             data_provider, run_name=run_name, n_epochs=args.epochs,
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size or spec["batch_size"],
-            group_size=args.group_size or spec["group_size"], val_data=val_data, val_every=args.val_every,
-            loss_fn=loss_fn, device=args.device,
+            group_size=args.group_size or spec["group_size"], val_group_size=spec["val_group_size"],
+            val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
         )
 
     run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval)
