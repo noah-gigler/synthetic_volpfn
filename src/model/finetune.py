@@ -135,6 +135,8 @@ def finetune(
     warmup_ratio: float = 0.1,
     device: str = "auto",
     seed: int = 0,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
 ) -> TabPFNRegressor:
     # grouped surfaces must not straddle accumulation windows; the data_provider must
     # draw equal context sizes per group (size_group=group_size)
@@ -181,6 +183,15 @@ def finetune(
     schedule_fn = get_cosine_schedule_with_warmup(total_steps=total_steps, warmup_steps=warmup_steps)
     scheduler = LambdaLR(optimizer, lr_lambda=schedule_fn)
 
+    wandb_run = None
+    if wandb_project is not None:
+        import wandb
+        wandb_run = wandb.init(project=wandb_project, entity=wandb_entity, name=run_name, config=dict(
+            n_epochs=n_epochs, n_surfaces_per_epoch=n_surfaces_per_epoch, batch_size=batch_size,
+            group_size=group_size, val_group_size=val_group_size, val_every=val_every,
+            lr=lr, weight_decay=weight_decay, grad_clip=grad_clip, warmup_ratio=warmup_ratio, seed=seed,
+        ))
+
     # frozen val set: preprocessed once (rebuilding would re-consume RNG and drift the val task)
     if val_data is not None:
         val_train, val_test = val_data
@@ -214,6 +225,8 @@ def finetune(
 
         is_val_epoch = val_surfaces is not None and ((epoch + 1) % val_every == 0 or epoch == n_epochs - 1)
         parts_str = "".join(f" {k}={np.mean(v):.4g}" for k, v in train_parts.items())
+        log_dict = {"train/loss": train_loss, "lr": scheduler.get_last_lr()[0]}
+        log_dict.update({f"train/{k}": float(np.mean(v)) for k, v in train_parts.items()})
 
         if is_val_epoch:
             val_losses, _ = _run_pass(estimator, val_surfaces, perf_opts, device, loss_fn=loss_fn)
@@ -227,6 +240,8 @@ def finetune(
                 "Epoch %d/%d | train_loss=%.4f%s val_loss=%.4f | by n_ctx: %s",
                 epoch + 1, n_epochs, train_loss, parts_str, val_loss, breakdown,
             )
+            log_dict["val/loss"] = val_loss
+            log_dict.update({f"val/loss_ctx_{s}": float(np.mean(v)) for s, v in by_size.items()})
         else:
             # no comparable val loss this epoch; only track best via train loss when
             # there is no val set at all
@@ -238,8 +253,13 @@ def finetune(
             torch.save(estimator.model_.state_dict(), out / "best.pt")
             log.info("Saved new best checkpoint (loss=%.4f) to %s/best.pt", best_loss, out)
 
+        if wandb_run is not None:
+            wandb_run.log(log_dict, step=epoch)
+
     torch.save(estimator.model_.state_dict(), out / "final.pt")
     log.info("Saved final model to %s/final.pt", out)
+    if wandb_run is not None:
+        wandb_run.finish()
     return estimator
 
 

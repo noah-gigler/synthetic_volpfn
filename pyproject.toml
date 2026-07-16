@@ -18,4 +18,5 @@ dependencies = [
     "scipy>=1.13.0",
     "tabpfn>=8.0.2",
     "vollib>=1.0.7",
+    "wandb>=0.28.1",
 ]

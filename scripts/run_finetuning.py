@@ -256,6 +256,8 @@ def main():
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--baseline-jobs", type=int, default=None,
                     help="CPU workers for the SSVI baseline refit (default: os.cpu_count())")
+    p.add_argument("--wandb-project", default="volpfn", help="W&B project name (empty string to disable)")
+    p.add_argument("--wandb-entity", default="volpfn", help="W&B team/entity name")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
@@ -271,6 +273,7 @@ def main():
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size or spec["batch_size"],
             group_size=args.group_size or spec["group_size"], val_group_size=spec["val_group_size"],
             val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
+            wandb_project=args.wandb_project or None, wandb_entity=args.wandb_entity,
         )
 
     run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval, baseline_jobs=args.baseline_jobs)
