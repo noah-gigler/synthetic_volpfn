@@ -71,7 +71,8 @@ def preprocess_surfaces(estimator, train, test, rng: np.random.Generator, group_
 
 
 def _stackable(a, b):
-    return all(x.shape == y.shape for x, y in zip(a["X_context"], b["X_context"]))
+    return (all(x.shape == y.shape for x, y in zip(a["X_context"], b["X_context"]))
+            and all(x.shape == y.shape for x, y in zip(a["X_query"], b["X_query"])))
 
 
 def _stack_group(group) -> RegressorBatch:

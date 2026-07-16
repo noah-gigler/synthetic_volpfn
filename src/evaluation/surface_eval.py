@@ -4,7 +4,7 @@ import torch
 from tabpfn import TabPFNRegressor
 from tabpfn.architectures.interface import PerformanceOptions
 
-from src.data_generation.grid import Grid
+from src.data_generation.grid import Grid, arb_grid_shape, sample_arb_grid
 from src.model.preprocessed_dataset import preprocess_surfaces
 
 _PERF = PerformanceOptions(force_recompute_layer=False, use_chunkwise_inference=False)
@@ -114,6 +114,60 @@ def quantile_coverage(model, train_list, test_list, reload_state=None, levels=(0
             hi = preds[qs.index(1 - (1 - lv) / 2)]
             coverages[lv].append(np.mean((y_te >= lo) & (y_te <= hi)))
     return {lv: float(np.mean(c)) for lv, c in coverages.items()}
+
+
+def eval_arbitrage_fine(model, train_list, cfg, reload_state=None, r_b_step_range=(0.019, 0.025)):
+    """Cell-level arb diagnostics on a dense random arb grid (reuses the training loss's own
+    `sample_arb_grid`, at higher tau-density than training via `r_b_step_range`).
+
+    Sign convention: metric < 0 means violated (mirrors Gatheral's g >= 0 no-arb condition), so
+    across both butterfly and calendar cells "more negative" always means "worse". Expects the
+    bid/ask-free schema from `quote_data_preparation`/`noisy_data_preparation` (`X = [z, tau, side]`).
+    """
+    n_zb, n_rc, n_zc = arb_grid_shape(cfg)
+    n_cal = (n_rc - 1) * n_zc
+
+    cell_fracs, mean_depths, worst_cells, arb_free = [], [], [], []
+    for X_tr, y_tr in train_list:
+        model.fit(X_tr, y_tr)
+        if reload_state is not None:
+            model.model_.load_state_dict(reload_state)
+
+        rows = sample_arb_grid(cfg, jitter=True, r_b_step_range=r_b_step_range)
+        pred = model.predict(rows)
+
+        n_but = len(rows) - 2 * n_cal
+        n_rb = n_but // n_zb
+        but_sl = slice(0, n_but)
+        lo_sl = slice(n_but, n_but + n_cal)
+        hi_sl = slice(n_but + n_cal, n_but + 2 * n_cal)
+
+        z_b = rows[but_sl, 0].reshape(n_rb, n_zb)[0]
+        tau_b = rows[but_sl, 1].reshape(n_rb, n_zb)[:, 0]
+        r_b = np.sqrt(tau_b)[:, None]
+        iv_b = np.maximum(pred[but_sl].reshape(n_rb, n_zb), 1e-3)
+
+        w = iv_b**2 * tau_b[:, None]
+        w_z = np.gradient(w, z_b, axis=-1)
+        w_zz = np.gradient(w_z, z_b, axis=-1)
+        w_k, w_kk, k = w_z / r_b, w_zz / r_b**2, z_b[None, :] * r_b
+        bf_metric = (1 - k * w_k / (2 * w)) ** 2 - w_k**2 / 4 * (1 / w + 0.25) + w_kk / 2
+
+        tau_lo = rows[lo_sl, 1].reshape(n_rc - 1, n_zc)[:, 0]
+        tau_hi = rows[hi_sl, 1].reshape(n_rc - 1, n_zc)[:, 0]
+        r_lo, r_hi = np.sqrt(tau_lo)[:, None], np.sqrt(tau_hi)[:, None]
+        iv_lo = np.maximum(pred[lo_sl].reshape(n_rc - 1, n_zc), 1e-3)
+        iv_hi = pred[hi_sl].reshape(n_rc - 1, n_zc)
+        cal_metric = iv_hi / iv_lo - r_lo / r_hi
+
+        metric = np.concatenate([bf_metric.ravel(), cal_metric.ravel()])
+        viol = metric < 0
+        cell_fracs.append(viol.mean())
+        mean_depths.append(metric[viol].mean() if viol.any() else 0.0)
+        worst_cells.append(metric.min())
+        arb_free.append(0.0 if viol.any() else 1.0)
+
+    return tuple(float(np.mean(x)) for x in (cell_fracs, mean_depths, worst_cells, arb_free))
 
 
 def inside_spread_fraction(model, train_list, reload_state=None):

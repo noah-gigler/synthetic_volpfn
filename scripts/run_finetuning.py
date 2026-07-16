@@ -20,7 +20,7 @@ from src.data_generation.noise import (
 from src.model.finetune import finetune
 from src.model.quote_loss import quote_arb_loss
 from src.model.SSVI import fit_ssvi, predict_ssvi
-from src.evaluation.surface_eval import eval_surfaces
+from src.evaluation.surface_eval import eval_arbitrage_fine, eval_surfaces
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "datasets"
@@ -176,32 +176,38 @@ def load_baselines(schema, cfg, eval_set, rebuild=False):
     return base
 
 
-def _write_eval_txt(path, experiment, results, baselines):
-    lines = []
+def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines):
+    lines = [f"{run_name} ({which}.pt), rho={rho}"]
+
     for m, rows in results.items():
-        lines.append(f"\n=== regime={m} (MAE | MAPE% vs truth) ===")
-        sup_mape = f"{experiment + ' MAPE':>15}"
+        lines.append(f"\n=== regime m={m} ===")
         if baselines is not None:
-            header = (f"{'n_ctx':>6} {experiment:>12} {'refit WLS':>12} {'mid straw':>12}"
-                      f"{sup_mape} {'WLS MAPE':>12}")
-        else:
-            header = f"{'n_ctx':>6} {experiment:>12}{sup_mape}"
-        lines.append(header)
-        for n_ctx, r in rows.items():
-            if baselines is not None:
+            lines.append(f"{'n_ctx':>6} {'FT MAE':>8} {'SSVI MAE':>9} {'FT MAPE%':>9} {'SSVI MAPE%':>11}")
+            for n_ctx, r in rows.items():
                 b = baselines[float(m)][int(n_ctx)]
-                lines.append(f"{n_ctx:>6} {r['mae']:>12.4f} {b['refit_wls']:>12.4f} {b['mid']:>12.4f}"
-                             f" {r['mape']:>14.2f}% {b['refit_wls_mape']:>11.2f}%")
-            else:
-                lines.append(f"{n_ctx:>6} {r['mae']:>12.4f} {r['mape']:>14.2f}%")
+                lines.append(f"{n_ctx:>6} {r['mae']:>8.4f} {b['refit_wls']:>9.4f}"
+                             f" {r['mape']:>9.2f} {b['refit_wls_mape']:>11.2f}")
+        else:
+            lines.append(f"{'n_ctx':>6} {'FT MAE':>8} {'FT MAPE%':>9}")
+            for n_ctx, r in rows.items():
+                lines.append(f"{n_ctx:>6} {r['mae']:>8.4f} {r['mape']:>9.2f}")
+
+    lines.append("\n\nArbitrage")
+    for m, rows in arb_results.items():
+        lines.append(f"\n=== regime m={m} ===")
+        lines.append(f"{'n_ctx':>6} {'cell_frac':>9} {'mean_depth':>11} {'worst_cell':>11} {'arb_free%':>10}")
+        for n_ctx, r in rows.items():
+            lines.append(f"{n_ctx:>6} {r['cell_frac']*100:>8.2f}% {r['mean_depth']:>11.4f}"
+                         f" {r['worst_cell']:>11.4f} {r['arb_free']*100:>9.1f}%")
+
     open(path, "w").write("\n".join(lines) + "\n")
 
 
-def run_eval(experiment, run_name, cfg, device, rebuild_eval=False):
+def run_eval(experiment, run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0):
     spec = EXPERIMENTS[experiment]
     eval_set = load_eval(spec["eval_schema"], cfg, rebuild=rebuild_eval)
-    model, state = load_finetuned(run_name, device)
-    results = {}
+    model, state = load_finetuned(run_name, device, which=which)
+    results, arb_results = {}, {}
     slots = [(m, n_ctx) for m, by_ctx in eval_set.items() for n_ctx in by_ctx]
     for i, (m, n_ctx) in enumerate(slots, 1):
         tr, te = eval_set[m][n_ctx]
@@ -210,11 +216,16 @@ def run_eval(experiment, run_name, cfg, device, rebuild_eval=False):
         results.setdefault(str(m), {})[n_ctx] = dict(
             mae=float(mae), mape=float(mape), cal_viol=float(cal), bf_viol=float(bf))
 
+        cell_frac, mean_depth, worst_cell, arb_free = eval_arbitrage_fine(model, tr, cfg, reload_state=state)
+        arb_results.setdefault(str(m), {})[n_ctx] = dict(
+            cell_frac=float(cell_frac), mean_depth=float(mean_depth),
+            worst_cell=float(worst_cell), arb_free=float(arb_free))
+
     baselines = load_baselines(spec["eval_schema"], cfg, eval_set, rebuild=rebuild_eval)
 
     out_dir = ROOT / "checkpoints" / run_name
-    json.dump(results, open(out_dir / "eval.json", "w"), indent=2)
-    _write_eval_txt(out_dir / "eval.txt", experiment, results, baselines)
+    json.dump(dict(mae=results, arb=arb_results), open(out_dir / "eval.json", "w"), indent=2)
+    _write_eval_txt(out_dir / "eval.txt", run_name, which, rho, results, arb_results, baselines)
     print(f"\nsaved eval -> {out_dir/'eval.json'}  and  {out_dir/'eval.txt'}")
     print(open(out_dir / "eval.txt").read())
 
