@@ -47,13 +47,15 @@ def _split_by_regime(build, n_total):
     return train, test
 
 
-def _supervised_val(cfg):
-    return _split_by_regime(lambda n, m: make_noisy_stratified_eval_set(cfg, n, VAL_CTX_SIZES, regime=m), 128)
+def _supervised_val(cfg, rho=0.0):
+    return _split_by_regime(
+        lambda n, m: make_noisy_stratified_eval_set(cfg, n, VAL_CTX_SIZES, regime=m, rho=rho), 128)
 
 
-def _arb_val(cfg):
+def _arb_val(cfg, rho=0.0):
     def build(n, m):
-        sets = [make_quote_eval_set(cfg, n, s, N_HELDOUT, regime=m, size_group=GROUP_SIZE) for s in VAL_CTX_SIZES]
+        sets = [make_quote_eval_set(cfg, n, s, N_HELDOUT, regime=m, size_group=GROUP_SIZE, rho=rho)
+                for s in VAL_CTX_SIZES]
         return sum((s[0] for s in sets), []), sum((s[1] for s in sets), [])
     return _split_by_regime(build, 128)
 
@@ -62,14 +64,15 @@ GROUP_SIZE = 8
 BATCH_SIZE = 32
 EXPERIMENTS = {
     "supervised": dict(
-        provider=lambda cfg, n_ctx: partial(noisy_data_preparation, cfg, n_context=n_ctx,  size_group=GROUP_SIZE),
+        provider=lambda cfg, n_ctx, rho: partial(
+            noisy_data_preparation, cfg, n_context=n_ctx, size_group=GROUP_SIZE, rho=rho),
         val=_supervised_val,
         loss=lambda cfg: None,
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=128,
     ),
     "arb": dict(
-        provider=lambda cfg, n_ctx: partial(
-            quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE),
+        provider=lambda cfg, n_ctx, rho: partial(
+            quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE, rho=rho),
         val=_arb_val,
         loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0, lambda_reg_z=0.01, lambda_reg_r=0.01),
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=GROUP_SIZE,
@@ -77,11 +80,12 @@ EXPERIMENTS = {
 }
 
 
-def load_eval(cfg, rebuild=False):
+def load_eval(cfg, rebuild=False, rho=0.0):
     # frozen eval set, shared across every experiment (both train on the noisy/bid-ask
     # schema); surfaces are seeded per n_ctx only, so it's reused as-is across models.
+    # rho=0 is the shared/default cache; any other rho gets its own file.
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    path = EVAL_DIR / "noisy.pkl"
+    path = EVAL_DIR / ("noisy.pkl" if rho == 0.0 else f"noisy_rho{rho}.pkl")
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
     eval_set = {}
@@ -89,7 +93,7 @@ def load_eval(cfg, rebuild=False):
         eval_set[m] = {}
         for n_ctx in EVAL_CTX_SIZES:
             np.random.seed(EVAL_SEED * 1000 + n_ctx)  # per-n_ctx -> same truth across regimes
-            eval_set[m][n_ctx] = noisy_data_preparation(cfg, EVAL_N, n_ctx, regime=m)
+            eval_set[m][n_ctx] = noisy_data_preparation(cfg, EVAL_N, n_ctx, regime=m, rho=rho)
     pickle.dump(eval_set, open(path, "wb"))
     return eval_set
 
@@ -107,13 +111,15 @@ def load_arb_grid(cfg, rebuild=False):
     return rows
 
 
-def load_val(experiment, cfg, rebuild=False):
+def load_val(experiment, cfg, rebuild=False, rho=0.0):
+    # rho=0 is the shared/frozen cache reused across every run of this experiment; any other
+    # rho gets its own cache so it doesn't clobber that baseline
     VAL_DIR.mkdir(parents=True, exist_ok=True)
-    path = VAL_DIR / f"{experiment}.pkl"
+    path = VAL_DIR / (f"{experiment}.pkl" if rho == 0.0 else f"{experiment}_rho{rho}.pkl")
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
     np.random.seed(VAL_SEED)
-    val = EXPERIMENTS[experiment]["val"](cfg)
+    val = EXPERIMENTS[experiment]["val"](cfg, rho=rho)
     pickle.dump(val, open(path, "wb"))
     return val
 
@@ -180,8 +186,10 @@ def _baselines(eval_set, cfg, n_jobs=None):
     return out
 
 
-def load_baselines(cfg, eval_set, rebuild=False, n_jobs=None):
-    path = EVAL_DIR / "noisy_baselines.json"
+def load_baselines(cfg, eval_set, rebuild=False, n_jobs=None, rho=0.0):
+    # baselines are context-dependent (SSVI refit sees the noisy quotes), so they're rho-aware
+    # the same way load_eval is: rho=0 is the shared cache, anything else gets its own file
+    path = EVAL_DIR / ("noisy_baselines.json" if rho == 0.0 else f"noisy_baselines_rho{rho}.json")
     if path.exists() and not rebuild:
         raw = json.load(open(path))
         return {float(m): {int(n): v for n, v in rows.items()} for m, rows in raw.items()}
@@ -213,7 +221,9 @@ def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines)
 
 
 def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, baseline_jobs=None):
-    eval_set = load_eval(cfg, rebuild=rebuild_eval)
+    # matched-rho eval: a model trained on correlated quote noise (rho!=0) should be evaluated
+    # against noise drawn the same way, not the default iid (rho=0) set - see notes/results_summary.md
+    eval_set = load_eval(cfg, rebuild=rebuild_eval, rho=rho)
     arb_rows = load_arb_grid(cfg, rebuild=rebuild_eval)
     model, state = load_finetuned(run_name, device, which=which)
     results, arb_results = {}, {}
@@ -231,7 +241,7 @@ def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, 
             cell_frac=float(cell_frac), mean_depth=float(mean_depth),
             worst_cell=float(worst_cell), arb_free=float(arb_free))
 
-    baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval, n_jobs=baseline_jobs)
+    baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval, n_jobs=baseline_jobs, rho=rho)
 
     out_dir = ROOT / "checkpoints" / run_name
     json.dump(dict(mae=results, arb=arb_results), open(out_dir / "eval.json", "w"), indent=2)
@@ -247,6 +257,9 @@ def main():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--n-surfaces", type=int, default=200)
     p.add_argument("--n-context", type=int, nargs=2, default=(3, 60), metavar=("LO", "HI"))
+    p.add_argument("--rho", type=float, default=0.0,
+                    help="quote-noise correlation (0=iid per quote, 1=shared per surface); "
+                         "non-zero gets its own val cache, the shared eval set stays at rho=0")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--group-size", type=int, default=None)
     p.add_argument("--val-every", type=int, default=5)
@@ -258,6 +271,8 @@ def main():
                     help="CPU workers for the SSVI baseline refit (default: os.cpu_count())")
     p.add_argument("--wandb-project", default="volpfn", help="W&B project name (empty string to disable)")
     p.add_argument("--wandb-entity", default="volpfn", help="W&B team/entity name")
+    p.add_argument("--feature-shift-method", default="shuffle", choices=["shuffle", "rotate", "none"],
+                    help="TabPFN ensemble feature-position shift ('none' disables it)")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
@@ -265,8 +280,8 @@ def main():
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
 
     if not args.eval_only:
-        val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val)
-        data_provider = spec["provider"](cfg, tuple(args.n_context))
+        val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=args.rho)
+        data_provider = spec["provider"](cfg, tuple(args.n_context), args.rho)
         loss_fn = spec["loss"](cfg)
         finetune(
             data_provider, run_name=run_name, n_epochs=args.epochs,
@@ -274,9 +289,11 @@ def main():
             group_size=args.group_size or spec["group_size"], val_group_size=spec["val_group_size"],
             val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
             wandb_project=args.wandb_project or None, wandb_entity=args.wandb_entity,
+            feature_shift_method=None if args.feature_shift_method == "none" else args.feature_shift_method,
         )
 
-    run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval, baseline_jobs=args.baseline_jobs)
+    run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval,
+             baseline_jobs=args.baseline_jobs, rho=args.rho)
 
 
 if __name__ == "__main__":
