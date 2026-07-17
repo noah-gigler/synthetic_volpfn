@@ -46,11 +46,22 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
         bardist = znorm_bardists[g]
         intervals = batch.y_query[g].to(logits_BQL.device)   # (Q, 2) znormed bounds
         mask = torch.isfinite(intervals).all(dim=-1)
-        # cdf() asserts on NaN inputs - fill masked-out rows with a valid dummy value
+        # a zero-width interval (bid==ask, e.g. regime=0's exact quotes) makes
+        # cdf(ask)-cdf(bid) exactly 0 for ANY prediction - not just bad ones, since a
+        # continuous distribution always assigns zero mass to a single point. That silently
+        # floors every such row to the same constant -log(min_prob) with no gradient signal
+        # toward the true value. Use the point density NLL (bardist.forward, the same
+        # bucket-cross-entropy the plain supervised path uses) for those rows instead.
+        is_point = mask & (intervals[:, 0] == intervals[:, 1])
+
+        # cdf()/forward() assert on NaN/out-of-range inputs - fill masked-out rows with a
+        # valid dummy; bid doubles as the point target since bid==ask on point rows anyway
         safe = torch.where(mask[:, None], intervals, bardist.borders[0].expand(Q, 2))
         cdf = bardist.cdf(logits, safe.expand(E, Q, 2))
-        p_inside = (cdf[..., 1] - cdf[..., 0]).clamp_min(min_prob)
-        nll = -torch.log(p_inside)[:, mask].mean()
+        interval_nll = -torch.log((cdf[..., 1] - cdf[..., 0]).clamp_min(min_prob))
+        point_nll = bardist.forward(logits, safe[:, 0].expand(E, Q))
+
+        nll = torch.where(is_point.expand(E, Q), point_nll, interval_nll)[:, mask].mean()
 
         iv = raw_bardists[g].mean(logits).clamp_min(1e-3)
         iv_b = iv[:, but_sl].reshape(E, n_rb, n_zb)

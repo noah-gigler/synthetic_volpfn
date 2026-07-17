@@ -74,7 +74,8 @@ EXPERIMENTS = {
         provider=lambda cfg, n_ctx, rho: partial(
             quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE, rho=rho),
         val=_arb_val,
-        loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0, lambda_reg_z=0.01, lambda_reg_r=0.01),
+        loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0,
+                                 lambda_reg_z=0.01, lambda_reg_r=0.01, return_parts=True),
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=GROUP_SIZE,
     ),
 }
