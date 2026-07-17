@@ -192,6 +192,7 @@ def finetune(
             group_size=group_size, val_group_size=val_group_size, val_every=val_every,
             lr=lr, weight_decay=weight_decay, grad_clip=grad_clip, warmup_ratio=warmup_ratio, seed=seed,
         ))
+        (out / "wandb_run_id.txt").write_text(f"{wandb_run.entity}/{wandb_run.project}/{wandb_run.id}")
 
     # frozen val set: preprocessed once (rebuilding would re-consume RNG and drift the val task)
     if val_data is not None:
