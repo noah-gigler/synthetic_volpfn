@@ -138,6 +138,7 @@ def finetune(
     wandb_project: str | None = None,
     wandb_entity: str | None = None,
     feature_shift_method: str | None = "shuffle",
+    init_state: dict | None = None,
 ) -> TabPFNRegressor:
     # grouped surfaces must not straddle accumulation windows; the data_provider must
     # draw equal context sizes per group (size_group=group_size)
@@ -171,6 +172,8 @@ def finetune(
         inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": feature_shift_method},
     )
     estimator._initialize_model_variables()
+    if init_state is not None:
+        estimator.model_.load_state_dict(init_state)
     estimator.model_.to(device)
     estimator.model_.train()
 

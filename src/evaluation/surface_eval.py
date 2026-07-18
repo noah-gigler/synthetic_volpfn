@@ -178,6 +178,39 @@ def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, gro
     return tuple(float(np.mean(x)) for x in (cell_fracs, mean_depths, worst_cells, arb_free))
 
 
+def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_size=64):
+    """Truth-free scoring for real quotes: MAE vs mid and inside-[bid,ask] fraction, at the
+    held-out quote locations and at the context quotes. Expects `make_real_eval_set(..., cfg=None)`
+    pairs: context X = [z, tau, side] (bids then asks), test = (held_rows, y_held (n, 2) [bid, ask])."""
+    est = _get_eval_estimator()
+    est.model_.load_state_dict(reload_state if reload_state is not None else _pretrained_state)
+
+    queries, targets = [], []
+    for (X_tr, y_tr), (X_held, y_held) in zip(train_list, test_list):
+        nc = len(y_tr) // 2
+        X_ctx = X_tr[:nc].copy()
+        X_ctx[:, 2] = 0.0
+        Xq = np.vstack([X_ctx, X_held])
+        bid = np.concatenate([y_tr[:nc], y_held[:, 0]])
+        ask = np.concatenate([y_tr[nc:], y_held[:, 1]])
+        queries.append((Xq, np.zeros(len(Xq))))  # y unused, pred-only query
+        targets.append((nc, bid, ask))
+
+    rng = np.random.default_rng(0)
+    surfaces = preprocess_surfaces(est, train_list, queries, rng, group_size=group_size)
+
+    out = {k: [] for k in ("mae_held", "inside_held", "mae_ctx", "inside_ctx")}
+    for (pred, _), (nc, bid, ask) in zip(_predict_raw(est, surfaces), targets):
+        mid = (bid + ask) / 2
+        inside = (pred >= bid) & (pred <= ask)
+        err = np.abs(pred - mid)
+        out["mae_held"].append(err[nc:].mean())
+        out["inside_held"].append(inside[nc:].mean())
+        out["mae_ctx"].append(err[:nc].mean())
+        out["inside_ctx"].append(inside[:nc].mean())
+    return {k: float(np.mean(v)) for k, v in out.items()}
+
+
 def inside_spread_fraction(model, train_list, reload_state=None):
     """Fraction of predictions at the quote locations lying within [bid, ask].
     Expects the bid/ask schema from src.data_generation.noise: X = [k, tau, side]

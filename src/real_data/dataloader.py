@@ -12,14 +12,18 @@ REPO = Path(__file__).resolve().parents[2]
 PATH = REPO / "datasets" / "processed" / "spxw.parquet"
 
 
-def load_surfaces():
-    return [g for _, g in pd.read_parquet(PATH).groupby("date", sort=True)]
+def load_surfaces(cfg=None):
+    df = pd.read_parquet(PATH)
+    if cfg is not None:
+        z, t = cfg["z"], cfg["ttm"]
+        df = df[df["z"].between(z["min"], z["max"]) & df["tau"].between(t["min"], t["max"])]
+    return [g for _, g in df.groupby("date", sort=True)]
 
 
-def temporal_split(start, end=None, val_months=1, test_months=3):
+def temporal_split(start, end=None, val_months=1, test_months=3, cfg=None):
     start = pd.Timestamp(start)
     end = pd.Timestamp(end or date.today() - timedelta(days=1))
-    pool = [s for s in load_surfaces() if start <= s["date"].iloc[0] <= end]
+    pool = [s for s in load_surfaces(cfg) if start <= s["date"].iloc[0] <= end]
 
     last = pool[-1]["date"].iloc[0]
     test_start = last - pd.DateOffset(months=test_months)
@@ -61,7 +65,7 @@ def build_task(pool, n, n_context, cfg=None, n_heldout=None, size_group=1):
     sizes = sample_context_sizes(n_context, n, group=size_group)
     train, test = [], []
     for start in range(0, n, size_group):
-        arb_rows = sample_arb_grid(cfg)[0] if cfg is not None else None
+        arb_rows = sample_arb_grid(cfg) if cfg is not None else None
         for nc in sizes[start:start + size_group]:
             tr, te = _split_surface(pool[np.random.randint(len(pool))], nc, arb_rows, n_heldout)
             train.append(tr)
@@ -72,7 +76,7 @@ def build_task(pool, n, n_context, cfg=None, n_heldout=None, size_group=1):
 def make_real_eval_set(pool, sizes, cfg=None, n_heldout=None):
     train, test = [], []
     for size in sizes:
-        arb_rows = sample_arb_grid(cfg)[0] if cfg is not None else None
+        arb_rows = sample_arb_grid(cfg) if cfg is not None else None
         for s in pool:
             tr, te = _split_surface(s, size, arb_rows, n_heldout)
             train.append(tr)
