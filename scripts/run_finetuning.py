@@ -81,12 +81,19 @@ EXPERIMENTS = {
 }
 
 
+def _rho_tag(rho):
+    # filename-safe cache suffix; a (lo, hi) range becomes e.g. rho0.0_1.0
+    if isinstance(rho, (tuple, list)):
+        return f"rho{rho[0]}_{rho[1]}"
+    return f"rho{rho}"
+
+
 def load_eval(cfg, rebuild=False, rho=0.0):
     # frozen eval set, shared across every experiment (both train on the noisy/bid-ask
     # schema); surfaces are seeded per n_ctx only, so it's reused as-is across models.
     # rho=0 is the shared/default cache; any other rho gets its own file.
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    path = EVAL_DIR / ("noisy.pkl" if rho == 0.0 else f"noisy_rho{rho}.pkl")
+    path = EVAL_DIR / ("noisy.pkl" if rho == 0.0 else f"noisy_{_rho_tag(rho)}.pkl")
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
     eval_set = {}
@@ -116,7 +123,7 @@ def load_val(experiment, cfg, rebuild=False, rho=0.0):
     # rho=0 is the shared/frozen cache reused across every run of this experiment; any other
     # rho gets its own cache so it doesn't clobber that baseline
     VAL_DIR.mkdir(parents=True, exist_ok=True)
-    path = VAL_DIR / (f"{experiment}.pkl" if rho == 0.0 else f"{experiment}_rho{rho}.pkl")
+    path = VAL_DIR / (f"{experiment}.pkl" if rho == 0.0 else f"{experiment}_{_rho_tag(rho)}.pkl")
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
     np.random.seed(VAL_SEED)
@@ -190,7 +197,7 @@ def _baselines(eval_set, cfg, n_jobs=None):
 def load_baselines(cfg, eval_set, rebuild=False, n_jobs=None, rho=0.0):
     # baselines are context-dependent (SSVI refit sees the noisy quotes), so they're rho-aware
     # the same way load_eval is: rho=0 is the shared cache, anything else gets its own file
-    path = EVAL_DIR / ("noisy_baselines.json" if rho == 0.0 else f"noisy_baselines_rho{rho}.json")
+    path = EVAL_DIR / ("noisy_baselines.json" if rho == 0.0 else f"noisy_baselines_{_rho_tag(rho)}.json")
     if path.exists() and not rebuild:
         raw = json.load(open(path))
         return {float(m): {int(n): v for n, v in rows.items()} for m, rows in raw.items()}
@@ -258,9 +265,10 @@ def main():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--n-surfaces", type=int, default=200)
     p.add_argument("--n-context", type=int, nargs=2, default=(3, 60), metavar=("LO", "HI"))
-    p.add_argument("--rho", type=float, default=0.0,
-                    help="quote-noise correlation (0=iid per quote, 1=shared per surface); "
-                         "non-zero gets its own val cache, the shared eval set stays at rho=0")
+    p.add_argument("--rho", type=float, nargs="+", default=[0.0], metavar="RHO",
+                    help="quote-noise correlation (0=iid per quote, 1=shared per surface); one value "
+                         "fixes it, two values (LO HI) sample it uniformly per surface; non-default "
+                         "gets its own val/eval cache, the shared caches stay at rho=0")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--group-size", type=int, default=None)
     p.add_argument("--val-every", type=int, default=5)
@@ -280,9 +288,11 @@ def main():
     run_name = args.run_name or f"{args.experiment}_{args.n_context[0]}_{args.n_context[1]}"
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
 
+    rho = args.rho[0] if len(args.rho) == 1 else tuple(args.rho)
+
     if not args.eval_only:
-        val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=args.rho)
-        data_provider = spec["provider"](cfg, tuple(args.n_context), args.rho)
+        val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=rho)
+        data_provider = spec["provider"](cfg, tuple(args.n_context), rho)
         loss_fn = spec["loss"](cfg)
         finetune(
             data_provider, run_name=run_name, n_epochs=args.epochs,
@@ -294,7 +304,7 @@ def main():
         )
 
     run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval,
-             baseline_jobs=args.baseline_jobs, rho=args.rho)
+             baseline_jobs=args.baseline_jobs, rho=rho)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ def add_quote_noise(k, tau, sigma_true, noise_cfg, regime=1.0, rho=0.0):
     return bid, ask
 
 
-def _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg, rho=0.0):
+def _noisy_split(g, surfaces, k_idx, t_idx, regimes, rhos, noise_cfg):
     # model feature is (z, tau, side); physical k = z·√τ is only used for BS spread pricing
     train, test = [], []
     for i in range(len(surfaces)):
@@ -60,7 +60,7 @@ def _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg, rho=0.0):
         idx = t_idx[i] * g.shape[1] + k_idx[i]
         zq, kq, tauq = g.z[idx], g.k[idx], g.tau[idx]
 
-        bid, ask = add_quote_noise(kq, tauq, sigma[idx], noise_cfg, regimes[i], rho)
+        bid, ask = add_quote_noise(kq, tauq, sigma[idx], noise_cfg, regimes[i], rhos[i])
 
         X_train = np.column_stack([
             np.tile(zq, 2), np.tile(tauq, 2), np.repeat([BID, ASK], len(zq)),
@@ -81,6 +81,13 @@ def _sample_regimes(noise_cfg, n, regime):
     return np.full(n, float(regime))
 
 
+def _sample_rhos(n, rho):
+    # rho is a scalar (fixed) or a (lo, hi) range that's sampled uniformly per surface
+    if isinstance(rho, (tuple, list)):
+        return np.random.uniform(rho[0], rho[1], n)
+    return np.full(n, float(rho))
+
+
 def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None, size_group=1, rho=0.0):
     # n_context counts quote locations (context holds 2*n_context rows)
     noise_cfg = cfg["noise"]
@@ -88,7 +95,8 @@ def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None, 
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
     k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes, n_samples=n)
     regimes = _sample_regimes(noise_cfg, n, regime)
-    return _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg, rho)
+    rhos = _sample_rhos(n, rho)
+    return _noisy_split(g, surfaces, k_idx, t_idx, regimes, rhos, noise_cfg)
 
 
 def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", regime=None, size_group=1, rho=0.0,
@@ -100,6 +108,7 @@ def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", re
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
     k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes + n_heldout, n_samples=n)
     regimes = _sample_regimes(noise_cfg, n, regime)
+    rhos = _sample_rhos(n, rho)
 
     train, test = [], []
     for start in range(0, n, size_group):
@@ -109,7 +118,7 @@ def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", re
             sigma = surfaces[i].ravel()
             idx = t_idx[i] * g.shape[1] + k_idx[i]
             zq, kq, tauq = g.z[idx], g.k[idx], g.tau[idx]
-            bid, ask = add_quote_noise(kq, tauq, sigma[idx], noise_cfg, regimes[i], rho)
+            bid, ask = add_quote_noise(kq, tauq, sigma[idx], noise_cfg, regimes[i], rhos[i])
 
             nc = len(idx) - n_heldout  # choice order is random -> first nc is a random split
             X_train = np.column_stack([
@@ -141,11 +150,12 @@ def make_noisy_stratified_eval_set(cfg, n_surfaces, context_sizes, regime=None, 
     noise_cfg = cfg["noise"]
     g, surfaces = generate_surfaces(cfg, n_surfaces)
     regimes = _sample_regimes(noise_cfg, n_surfaces, regime)
+    rhos = _sample_rhos(n_surfaces, rho)
 
     train, test = [], []
     for size in context_sizes:
         k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, np.full(n_surfaces, size), n_samples=n_surfaces)
-        tr, te = _noisy_split(g, surfaces, k_idx, t_idx, regimes, noise_cfg, rho)
+        tr, te = _noisy_split(g, surfaces, k_idx, t_idx, regimes, rhos, noise_cfg)
         train += tr
         test += te
 
