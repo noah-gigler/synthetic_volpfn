@@ -15,13 +15,6 @@ SSVI-generated surfaces as training data (see `VolSmoothing_with_TabPFN_proposal
   note, a gotcha (e.g. `regime=0 -> bid=ask=true`). If it wouldn't confuse a reader,
   don't write it. Match `src/data_generation/SSVI.py`'s density, not `data_preperation.py`'s.
 
-## Code style
-
-- No docstrings. No comments restating what the code obviously does.
-- A `#` comment is only for the non-obvious: a formula/theorem reference, a units/shape
-  note, a gotcha (e.g. `regime=0 -> bid=ask=true`). If it wouldn't confuse a reader,
-  don't write it. Match `src/data_generation/SSVI.py`'s density, not `data_preperation.py`'s.
-
 ## Commands
 
 - Environment is managed with `uv` (Python 3.12 pinned via `.python-version`); dependencies in `pyproject.toml` / `uv.lock`.
@@ -41,6 +34,51 @@ SSVI-generated surfaces as training data (see `VolSmoothing_with_TabPFN_proposal
 - **EOD snapshot rule:** pull exactly one aligned block `16:10:00–16:15:00 ET` per trading day (5 one-min bars
   at minimum cost — you pay for the whole block regardless, so take all of it). Keep the window snapped inside
   `[16:10, 16:15)`; never cross a `:05` boundary. The 16:15 SPXW close is the block end.
+
+## Euler cluster (Slurm)
+
+- Training runs live on ETH's Euler cluster; the repo is checked out at `~/synthetic_volpfn` on
+  both the login node (`euler`) and every compute node (shared filesystem).
+- **GPU jobs must set `--gres=gpumem:90g`** to actually get a large-VRAM card — `--partition`
+  doesn't control this (a common wrong assumption); it's `--gres=gpumem:<N>g` that matters. Without
+  it, Slurm can hand out a smaller-VRAM GPU, causing OOM crashes on large-query workloads (the
+  quote/arb loss's arb-grid query is ~10x bigger than the native grid). Still pin `--gpus=<type>:1`
+  for the right card type and `--partition=cuda13pr.24h` (or `cuda13pr.120h` for runs over 24h wall-time,
+  same GPU pool, longer cap).
+- **CPU-only work** (SSVI baseline refit, building the frozen eval set) needs no GPU — request a
+  plain `salloc --cpus-per-task=<N> --mem-per-cpu=<small>` allocation instead (don't reuse a GPU
+  job's single default CPU for parallel work; `scripts/run_finetuning.py`'s baseline refit uses
+  `ProcessPoolExecutor`, see `--baseline-jobs`).
+- **Compute nodes cannot reach `storage.googleapis.com`** (connection refused) even though they
+  can reach `api.wandb.ai` — this only surfaces when something tries to upload a *file* (wandb
+  Artifacts/`save()`/`upload_file()`), not when logging scalar metrics. Any file upload must run
+  from the **login node**, not inside an sbatch job. See "Weights & Biases" below.
+- Multiple sbatch jobs can land on the same physical node/GPU if it has spare capacity — this is
+  normal on Euler's shared nodes, not a scheduling bug; only worth investigating if actual OOM
+  crashes happen, not just co-location.
+- `euler.ethz.ch` round-robins across several login nodes per SSH connection — a `tmux`/`salloc`
+  session on one connection is invisible from the next. Pin to a specific login node hostname for
+  anything needing a persistent session across multiple commands.
+- SSH key auth: if it starts prompting for a passphrase every time instead of once via Keychain,
+  check `~/.ssh/config`'s `Host euler` block has `UseKeychain yes` + `AddKeysToAgent yes` +
+  explicit `IdentityFile`.
+
+## Weights & Biases
+
+- Team/project: entity `volpfn`, project `volpfn` (`wandb.ai/volpfn/volpfn`) — both
+  `finetune()`'s `wandb_project`/`wandb_entity` params and `run_finetuning.py`'s
+  `--wandb-project`/`--wandb-entity` CLI flags default to these, so it's on by default for every
+  run (`--wandb-project ""` disables it).
+- `finetune()` logs per-epoch `train/loss`, `lr`, any `loss_fn` parts (e.g. arb loss's
+  `nll`/`cal`/`bf`/`reg_z`/`reg_r`, only present when `return_parts=True`), and on val epochs
+  `val/loss` + `val/loss_ctx_{n}` per context size — all scalar metrics, which sync fine from
+  compute nodes.
+- **File uploads (`train.log`/`eval.txt`/`final.pt`) do NOT happen automatically** — compute nodes
+  can't reach GCS (see above), so `finetune()`/`run_eval()` skip file upload entirely rather than
+  hanging forever retrying. To attach files, run `scripts/upload_to_wandb.py` **from the login
+  node** (`ssh euler`, not a compute node) — it matches each `checkpoints/<run_name>/` dir to the
+  wandb run of the same name and uploads whatever of `train.log`/`eval.txt`/`final.pt` exist there.
+  Safe to re-run repeatedly (just re-uploads).
 
 ## Architecture
 

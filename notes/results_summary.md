@@ -1,4 +1,4 @@
-# Results summary (as of 2026-07-16)
+# Results summary (as of 2026-07-17)
 
 Everything before the `z`-reparametrization + widened grid (`config.yaml`: `z∈[-1.5,0.5]`,
 `ttm_min=0.02`, commit `1c4c12e7` onward) is archived in git history, not repeated here — those
@@ -9,7 +9,9 @@ comparison point anymore. This doc covers the current grid/config only.
 
 **`ssvi_supervised_gs4_12h`** — supervised (true-IV) loss, `group_size=4, batch_size=16`,
 2400 epochs × 30 steps/epoch = **72,000 optimizer steps** (~12h on an RTX Pro 6000 Blackwell).
-Checkpoint + logs in `checkpoints/ssvi_supervised_gs4_12h/`.
+Checkpoint + logs in `checkpoints/ssvi_supervised_gs4_12h/`. A `ssvi_supervised_gs4_24h` run
+(same recipe, 4800 epochs = 144,000 steps) is in progress to see if the trend continues past 72k;
+not yet evaluated.
 
 Beats every other checkpoint we have (`ssvi_supervised_gs1_15k`, `ssvi_supervised_gs4_15k`, and an
 externally-trained `ssvi_supervised_overnight_lightning`, 16k steps/batch_size=32) on identical
@@ -80,6 +82,124 @@ ahead from `n≈20` on, as expected.
    Fixed in `add_quote_noise` (`noise.py`) with a hard early-return (`bid=ask=true`) rather than
    scaling, since `tick`'s presence in `half_spread` must stay untouched for `regime>0`.
 
+## Session 2 (2026-07-17) — pipeline overhaul, a real training bug found+fixed, several ablations
+
+**Everything in the "Arbitrage (OpDS quote-loss) investigation" section below predates a
+significant bug fix (finding 13) and should be read as historical context for how the
+investigation unfolded, not as current numbers.** The new findings in this section supersede it.
+
+13. **Side-column label leak (major bug, fixed).** `sample_arb_grid` (`grid.py`) used to mark each
+    arb-grid row's type via literal sentinel values on the `side` feature column
+    (`BUTTERFLY=2.0`/`CAL_LOW=3.0`/`CAL_HIGH=4.0`, only meant for `quote_loss.py`'s row-type
+    bookkeeping) — but those same rows were also fed to the model as `X_query` input, meaning the
+    model saw a literal "this is a butterfly-check point" signal on every arb-grid query it ever
+    trained on. This let it partially shortcut the arb penalty via the marker rather than learning
+    genuine (z,tau)-only smoothness. Fixed: markers removed entirely; `side` is `0.0` on every
+    arb-grid row (matching a real query), and row-type bookkeeping in `quote_loss.py` is now done
+    by pure position/count arithmetic (`arb_grid_shape(cfg)` gives the fixed axis counts needed to
+    recover row boundaries without any marker). Retraining
+    `curvature_jitter` under the fix (`ssvi_opds_arb_curvature_jitter_v2`, exact original
+    hyperparameters) shows a large, real improvement at the same eval slot (regime=1, n_ctx=20):
+    cell_frac **10.74%→1.80%** (~6x), arb_free% **3.3%→14.5%** (~4x) — confirming the leak had
+    real cost, not just a theoretical concern.
+14. **The `group_size=4`/long-step-count recipe (finding 1-2) generalizes to arb loss too**, closing
+    the open item from session 1. `ssvi_opds_arb_curvature_jitter_gs4_15k` (group_size=4,
+    batch_size=16, 15k steps, same loss as v2) beats `v2` (group_size=20, batch_size=40, 6k steps)
+    on both axes at regime=1, n_ctx=60: MAE 0.0069→0.0053 (23% better), arb_free% 10.4%→17.4% (67%
+    relative better). A full-budget (72k-step) arb run under the *fixed* NLL (finding 17) is the
+    natural next step — an earlier attempt at this under the *pre-fix* loss was cancelled and its
+    checkpoint dir deleted once the NLL bug was found, to avoid wasting the 72k-step budget on
+    stale loss math.
+15. **Eval pipeline overhaul**: `EVAL_N` raised 50→512 surfaces/slot (24 slots = 12,288 surfaces
+    total), `eval_surfaces` (MAE pass) and `eval_arbitrage_fine` (arb pass) both batched via
+    `preprocess_surfaces`/`group_size` instead of one-surface-at-a-time (`eval_surfaces` default
+    `group_size=128`, cheap: ~11ms/surface; `eval_arbitrage_fine` default `group_size=8`, the arb
+    grid is ~10x bigger per surface so it OOMs above that — was previously defaulted to 16, which
+    now OOMs on the finer eval-only grid, fixed). The SSVI baseline refit
+    (`load_baselines`/`_baselines`) is now parallelized via `ProcessPoolExecutor` (embarrassingly
+    parallel per-surface `scipy` fits, CPU-only, no GPU needed) — serial cost for N=512 was
+    projected at ~18min, parallel across 32-64 cores brings it to ~1.5min, and it can run on a
+    completely separate CPU-only allocation from the GPU eval passes (`--baseline-jobs`).
+    `eval_arbitrage_fine` now takes a *frozen* arb grid (`load_arb_grid`, seeded once, reused
+    across every checkpoint) instead of resampling a fresh random grid per surface — training's own
+    `sample_arb_grid` randomizes the tau-row step every call, which is correct for training
+    (fresh grid every step) but meant no two eval calls used the same grid, blocking both batching
+    (unequal query shapes can't stack) and apples-to-apples comparison across checkpoints/runs.
+    Val sets are also stratified: 128 surfaces per context size, split evenly across
+    `EVAL_REGIMES=[0,0.5,1,2]` (was a single continuous `lognormal` draw, unstratified, only
+    20-ish surfaces per context size) — `val_group_size` (128 supervised, 8 arb, independent of
+    training's own `group_size`) controls val-pass batching.
+16. **Noise-set size-planning (established via direct measurement, not guessing)**: relative
+    standard error at N=50 (the old default) was ~11-13% for MAE and worse for arb metrics —
+    `arb_free%` (a low-mean Bernoulli, ~17-19% base rate) is the noisiest metric by far, ~29-31%
+    relative SE at N=50, still ~9-10% at N=512; `worst_cell` is an order statistic (min), for which
+    `std/√N` isn't a rigorous SE, treat it as directional only. `cell_frac`/`mean_depth`/MAE behave
+    like clean i.i.d. means (bootstrap SE matches the analytic `std/√N` almost exactly) and reach
+    single-digit-% relative error by N≈256-512. This is why `EVAL_N=512` was chosen (finding 15).
+17. **A second, more fundamental arb-loss bug (found via root-causing the negative-IV outlier
+    below), fixed.** `quote_arb_loss`'s interval NLL is `-log(CDF(ask) - CDF(bid))`, correct for a
+    genuine nonzero-width interval — but at `regime=0` (`add_quote_noise` returns `bid=ask=true`
+    exactly), the interval has *zero width*, and for any continuous distribution
+    `CDF(x) - CDF(x) = 0` **by construction**, regardless of whether the prediction is good or bad.
+    That NLL term silently floors to the `min_prob` clamp's constant value every time, carrying
+    zero gradient toward the true value — at `regime=0` the model was only ever getting shape
+    (`cal`/`bf`) pressure, never an accuracy signal. Fixed: zero-width rows now use the point/bucket
+    cross-entropy (`bardist.forward`, the same mechanism the plain supervised path already uses)
+    instead of the interval CDF formula; genuine (nonzero-width) intervals are unaffected. Not yet
+    retrained under this fix at the time of writing (`ssvi_opds_arb_curvature_jitter_gs4_15k_v2` is
+    in progress) — expected to reduce or eliminate finding 18's negative-IV pathology, since it's
+    the direct mechanism that made `regime=0` an under-constrained blind spot.
+18. **Negative-IV prediction outlier, characterized and root-caused (pre-finding-17-fix).** Arb-loss
+    checkpoints occasionally predict a **negative** raw IV at isolated grid points (regime=0,
+    n_ctx=40: up to 20% of surfaces have ≥1 negative point). Confirmed **not** a resolution/
+    extrapolation artifact — retested on the *training*-resolution grid (coarser than eval's) and
+    the problem is if anything worse there (`worst_cell` as low as -1.6M vs -8.1K on the finer eval
+    grid), so it's a genuine training-time model behavior, not an eval-grid-mismatch artifact.
+    Strictly confined to `regime=0`: exactly 0.0% of surfaces show any negative prediction at
+    regimes 0.5/1/2, across every context size tested — directly explained by finding 17 (regime=0
+    is the one setting where the NLL provides no accuracy gradient at all). A negative prediction
+    gets clamped to `1e-3` before the arb metric's `1/w` (total-variance) terms, creating an
+    artificial near-zero dip between otherwise-normal neighboring predictions, which the metric's
+    finite-difference second derivative amplifies into an enormous (theoretically unbounded)
+    apparent violation depth — this is why `mean_depth`/`worst_cell` (plain `.mean()`/`.min()`
+    across surfaces) get dominated by a handful of outlier surfaces: at regime=0, n_ctx=40,
+    `mean_depth` was -24.12 by mean vs -1.38 by median (17x), `worst_cell` -566,218 vs -7.97
+    (71,000x) — while regimes 0.5/1/2 (zero negative predictions) show mean and median close
+    together, confirming the distortion is entirely a regime=0 artifact. Decision: retrain under
+    the finding-17 fix first rather than patch the reporting (median-based `eval_arbitrage_fine`
+    reporting) — if the fix resolves the root cause, the metric distortion goes away on its own.
+19. **rho ablation — training-time noise correlation, matched-eval comparison.** `rho` (single-
+    factor Gaussian copula, `rho=0`=iid per-quote noise, `rho=1`=one shared draw per surface,
+    added in session 1 finding 4) re-tested with a *matched* eval set this time (same rho used for
+    training and eval, not the mismatched cross-test from session 1). `rho=1` (`gs4_15k` recipe)
+    dramatically **beats** the `rho=0` baseline on MAE at larger context, and the gap *grows* with
+    context rather than shrinking. Regime m=1, FT MAE (rho=0 vs rho=1):
+    - n_ctx=3: 0.0296 (rho=0) vs 0.0280 (rho=1) — small gap
+    - n_ctx=20: 0.0055 vs 0.0035 — rho=1 ~1.6x better
+    - n_ctx=60: 0.0029 vs 0.0016 — rho=1 ~1.8x better, and **beats the SSVI refit oracle**
+      (0.0045) by ~2.8x, a regime where SSVI normally wins or ties
+    Mechanism: at `rho=1`, `_corr_normal`'s per-quote term (`sqrt(1-rho)·z_quote`) vanishes
+    entirely (`sqrt(1-1)=0`) — the whole surface's noise reduces to just 2 shared scalars (one for
+    spread-width jitter, one for in-spread placement), not N independent draws. With enough
+    context the model can identify those 2 scalars and algebraically invert back to the true IV
+    almost exactly, which is why MAE keeps *shrinking* with more context instead of plateauing at
+    a noise floor the way it does under genuine per-quote noise. SSVI's weighted least-squares
+    refit doesn't exploit this collapsed structure (treats each residual as independent), so it
+    loses its usual large-context advantage here. Arb-freeness is a wash between rho=0/rho=1
+    (`cell_frac` averaged across context sizes per regime: within 0.1-0.4pp of each other, no
+    consistent winner) — the rho effect is specifically an MAE/noise-model story, unrelated to
+    arbitrage structure. A `rho=0.5` run (same recipe) is queued/in progress to fill in the
+    middle of this curve; not yet evaluated.
+20. **`FEATURE_SHIFT_METHOD` ablation.** TabPFN's ensemble feature-position shift (`"shuffle"` by
+    default, shuffles feature column order per ensemble member to emulate position-invariance)
+    matters even at `n_estimators=1`: disabling it (`None`) hurts MAE consistently across every
+    context size tested, worse at small context (regime m=1: n_ctx=3 0.0296→0.0410, +38%; n_ctx=60
+    0.0029→00033, +14%). Keep the default; no reason found to disable it. (`"rotate"`, the third
+    option, not yet tested.)
+21. **wandb integration added** (`wandb.ai/volpfn/volpfn`) — per-epoch scalar logging built into
+    `finetune()`, on by default via `run_finetuning.py`'s CLI. See `CLAUDE.md`'s "Weights & Biases"
+    section for the compute-node file-upload caveat (files need a separate login-node step).
+
 ## Arbitrage (OpDS quote-loss) investigation — open, not resolved
 
 7. **The eval-side arb metric was misleading.** `check_arbitrage`/`eval_surfaces` report
@@ -112,14 +232,7 @@ ahead from `n≈20` on, as expected.
     actually pay off, matching what the historical real-data run history already implied
     (violators-only + coarse grid still left ~50% `.any()`-arb; only violators-only + fine+jittered
     grid together got to ~5%).**
-11. **Direct measurement confirms this is a coverage problem, not a lambda-magnitude problem.**
-    Evaluating `g_fn` on the *exact* training collocation points (not an eval-side grid) gave
-    literally 0/2200 violating points for a real trained checkpoint — the model satisfies the
-    constraint perfectly wherever it's actually checked during training, while a broader fine grid
-    still shows ~1-2% violation. Raising lambda further cannot help this: there's no gradient to
-    amplify when the sampled points are already all satisfied. The fix has to be *coverage*
-    (denser/differently-structured tau sampling), not loss weight.
-12. **Comparison caveat: supervised (non-arb) models are never trained on off-grid query points at
+11. **Comparison caveat: supervised (non-arb) models are never trained on off-grid query points at
     all** — their query is always the fixed native 25x15 grid, every epoch. Arb-loss models get
     (sparse, phase-biased) off-grid exposure via `sample_arb_grid`. So the earlier read that "arb
     loss only modestly beats plain supervised on fine-grid violation rate" (supervised: 50% of
@@ -160,15 +273,26 @@ ahead from `n≈20` on, as expected.
 
 ## Open items
 
-- Fix the butterfly tau-axis phase-anchoring bug (finding 9) — highest-priority remaining lever
-  for arb, per finding 11's direct evidence that it's a coverage problem, not a lambda problem.
+- ~~Fix the butterfly tau-axis phase-anchoring bug (finding 9)~~ — resolved as a side effect of the
+  session-2 grid rewrite (finding 13): `sample_arb_grid`'s `r_b` axis now always goes through
+  `_jittered_axis`, which randomizes the start offset every call, not just the step.
+- ~~Apply the `group_size=4`, long-step-count recipe to arb~~ — done, finding 14.
+- **Retrain arb (`curvature_jitter`) under the finding-17 NLL fix** and re-check whether finding
+  18's negative-IV outlier is actually resolved (`ssvi_opds_arb_curvature_jitter_gs4_15k_v2` in
+  progress at time of writing) — this is the most important open item, since findings 14/18's
+  numbers were all measured under the pre-fix loss.
+- Once retrained under the fix, run the full-budget (72k-step) arb run that was cancelled
+  pre-fix (finding 14) — apply the same "more steps helps" lever arb now shares with supervised.
+- Evaluate `ssvi_supervised_gs4_24h` (144k steps, in progress) — does the "more steps helps" trend
+  from finding 2 continue past 72k, or start flattening?
+- Evaluate the queued `rho=0.5` run (finding 19) to fill in the middle of the rho curve.
 - Re-test violators-only reduction *after* the grid-density fix, not before — finding 10 suggests
-  it needs the density fix to pay off rather than backfiring.
-- Run the off-grid-exposure-only ablation (finding 12) to properly isolate the arb loss's real
+  it needs the density fix to pay off rather than backfiring; now that finding 9 is resolved this
+  is unblocked.
+- Run the off-grid-exposure-only ablation (finding 11) to properly isolate the arb loss's real
   contribution from the off-grid-query effect.
-- Apply the `group_size=4`, long-step-count recipe (the supervised winner) to the quote/arb-loss
-  model too — all arb runs so far have used comparatively few steps (~500 epochs at
-  `group_size=20/batch_size=40` ≈ 6-8k steps), not the 72k-step budget that closed the gap for
-  supervised.
+- Decide whether to switch `eval_arbitrage_fine` to median-based `mean_depth`/`worst_cell`
+  reporting (finding 18) — deprioritized in favor of fixing the root cause first, revisit if the
+  outlier persists after retraining.
 - Real-data calibration (SPXW quotes) not revisited this session — last state predates the grid
   reparametrization; needs re-validation before reuse.
