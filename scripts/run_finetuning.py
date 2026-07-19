@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import yaml
 from tabpfn import TabPFNRegressor
+from tabpfn.constants import ModelVersion
 
 from src.data_generation.grid import Grid, sample_arb_grid, z_to_k
 from src.data_generation.noise import (
@@ -132,11 +133,12 @@ def load_val(experiment, cfg, rebuild=False, rho=0.0):
     return val
 
 
-def load_finetuned(run_name, device, which="final"):
-    model = TabPFNRegressor(
-        fit_mode="fit_preprocessors", n_estimators=1,
-        inference_config={"FINGERPRINT_FEATURE": False},
-    )
+def load_finetuned(run_name, device, which="final", model_version=None):
+    common = dict(fit_mode="fit_preprocessors", n_estimators=1, inference_config={"FINGERPRINT_FEATURE": False})
+    if model_version is not None:
+        model = TabPFNRegressor.create_default_for_version(version=ModelVersion(model_version), **common)
+    else:
+        model = TabPFNRegressor(**common)
     model._initialize_model_variables()
     state = torch.load(ROOT / "checkpoints" / run_name / f"{which}.pt", map_location=device)
     model.model_.load_state_dict(state)
@@ -228,23 +230,24 @@ def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines)
     open(path, "w").write("\n".join(lines) + "\n")
 
 
-def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, baseline_jobs=None):
+def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, baseline_jobs=None,
+             model_version=None):
     # matched-rho eval: a model trained on correlated quote noise (rho!=0) should be evaluated
     # against noise drawn the same way, not the default iid (rho=0) set - see notes/results_summary.md
     eval_set = load_eval(cfg, rebuild=rebuild_eval, rho=rho)
     arb_rows = load_arb_grid(cfg, rebuild=rebuild_eval)
-    model, state = load_finetuned(run_name, device, which=which)
+    model, state = load_finetuned(run_name, device, which=which, model_version=model_version)
     results, arb_results = {}, {}
     slots = [(m, n_ctx) for m, by_ctx in eval_set.items() for n_ctx in by_ctx]
     for i, (m, n_ctx) in enumerate(slots, 1):
         tr, te = eval_set[m][n_ctx]
         print(f"[{i}/{len(slots)}] regime={m} n_ctx={n_ctx} ...", flush=True)
-        mae, mape, cal, bf = eval_surfaces(model, tr, te, cfg, reload_state=state)
+        mae, mape, cal, bf = eval_surfaces(model, tr, te, cfg, reload_state=state, model_version=model_version)
         results.setdefault(str(m), {})[n_ctx] = dict(
             mae=float(mae), mape=float(mape), cal_viol=float(cal), bf_viol=float(bf))
 
         cell_frac, mean_depth, worst_cell, arb_free = eval_arbitrage_fine(
-            model, tr, cfg, arb_rows, reload_state=state)
+            model, tr, cfg, arb_rows, reload_state=state, model_version=model_version)
         arb_results.setdefault(str(m), {})[n_ctx] = dict(
             cell_frac=float(cell_frac), mean_depth=float(mean_depth),
             worst_cell=float(worst_cell), arb_free=float(arb_free))
@@ -282,6 +285,17 @@ def main():
     p.add_argument("--wandb-entity", default="volpfn", help="W&B team/entity name")
     p.add_argument("--feature-shift-method", default="shuffle", choices=["shuffle", "rotate", "none"],
                     help="TabPFN ensemble feature-position shift ('none' disables it)")
+    p.add_argument("--from-scratch", action="store_true",
+                    help="randomize the pretrained TabPFN weights before training instead of "
+                         "finetuning from them - needs a much higher --lr than the finetuning default")
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--init-from", default=None,
+                    help="continue training from checkpoints/<run>/final.pt instead of the "
+                         "pretrained TabPFN weights (a fresh run, not a resume - new run_name/dir)")
+    p.add_argument("--model-version", default=None, choices=["v2", "v2.5", "v2.6", "v3"],
+                    help="TabPFN checkpoint version (default: current package default, v3). "
+                         "Must already be cached (~/.cache/tabpfn) before running on a compute "
+                         "node with no internet - see scripts/predownload_tabpfn.py")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
@@ -294,6 +308,9 @@ def main():
         val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=rho)
         data_provider = spec["provider"](cfg, tuple(args.n_context), rho)
         loss_fn = spec["loss"](cfg)
+        init_state = None
+        if args.init_from is not None:
+            init_state = torch.load(ROOT / "checkpoints" / args.init_from / "final.pt", map_location=args.device)
         finetune(
             data_provider, run_name=run_name, n_epochs=args.epochs,
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size or spec["batch_size"],
@@ -301,10 +318,12 @@ def main():
             val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
             wandb_project=args.wandb_project or None, wandb_entity=args.wandb_entity,
             feature_shift_method=None if args.feature_shift_method == "none" else args.feature_shift_method,
+            from_scratch=args.from_scratch, lr=args.lr, init_state=init_state,
+            model_version=args.model_version,
         )
 
     run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval,
-             baseline_jobs=args.baseline_jobs, rho=rho)
+             baseline_jobs=args.baseline_jobs, rho=rho, model_version=args.model_version)
 
 
 if __name__ == "__main__":

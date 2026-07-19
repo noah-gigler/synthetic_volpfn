@@ -17,6 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from tabpfn import TabPFNRegressor
 from tabpfn.architectures.interface import PerformanceOptions
+from tabpfn.constants import ModelVersion
 from tabpfn.finetuning.finetuned_regressor import _compute_regression_loss
 from tabpfn.finetuning.train_util import get_cosine_schedule_with_warmup
 
@@ -139,6 +140,8 @@ def finetune(
     wandb_entity: str | None = None,
     feature_shift_method: str | None = "shuffle",
     init_state: dict | None = None,
+    from_scratch: bool = False,
+    model_version: str | None = None,
 ) -> TabPFNRegressor:
     # grouped surfaces must not straddle accumulation windows; the data_provider must
     # draw equal context sizes per group (size_group=group_size)
@@ -165,13 +168,37 @@ def finetune(
     file_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
     root_logger.addHandler(file_handler)
 
-    estimator = TabPFNRegressor(
+    common_kwargs = dict(
         fit_mode="batched",
-        n_estimators=1,
+        n_estimators=1,  # required for training stability, see CLAUDE.md
         device=device,
         inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": feature_shift_method},
     )
+    if model_version is not None:
+        # create_default_for_version's own defaults (n_estimators=8, softmax_temperature=0.9)
+        # get overridden by common_kwargs below - only model_path/version-specific settings differ
+        estimator = TabPFNRegressor.create_default_for_version(
+            version=ModelVersion(model_version), **common_kwargs,
+        )
+    else:
+        estimator = TabPFNRegressor(**common_kwargs)
     estimator._initialize_model_variables()
+    if from_scratch:
+        # _initialize_model_variables() loads the pretrained checkpoint into estimator.model_
+        # (architecture/config/device setup still needs to run) - wipe it back to a fresh random
+        # init via each submodule's own reset_parameters(), rather than the pretrained prior
+        def _randomize(module):
+            for m in module.modules():
+                if hasattr(m, "reset_parameters"):
+                    m.reset_parameters()
+        estimator.model_.apply(_randomize)
+        # a few raw nn.Parameters (inducing_vectors, cls_tokens) have no reset_parameters and
+        # would otherwise keep their pretrained content; rope.freqs is a deterministic
+        # positional-frequency formula, not a learned prior, so it's left alone
+        with torch.no_grad():
+            for name, p in estimator.model_.named_parameters():
+                if "inducing_vectors" in name or "cls_tokens" in name:
+                    p.normal_(0, 0.02)
     if init_state is not None:
         estimator.model_.load_state_dict(init_state)
     estimator.model_.to(device)

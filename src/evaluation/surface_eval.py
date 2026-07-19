@@ -3,31 +3,39 @@ import torch
 
 from tabpfn import TabPFNRegressor
 from tabpfn.architectures.interface import PerformanceOptions
+from tabpfn.constants import ModelVersion
 
 from src.data_generation.grid import Grid, arb_grid_shape
 from src.model.preprocessed_dataset import preprocess_surfaces
 
 _PERF = PerformanceOptions(force_recompute_layer=False, use_chunkwise_inference=False)
-_eval_estimator = None
-_pretrained_state = None
+_eval_estimators: dict = {}  # (model_version, feature_shift_method) -> (estimator, pretrained_state)
 
 
-def _get_eval_estimator():
-    # one batched estimator, built once and reused; callers swap weights via load_state_dict
-    # instead of re-fitting/reloading per surface (the old per-surface path was the bottleneck)
-    global _eval_estimator, _pretrained_state
-    if _eval_estimator is None:
+def _get_eval_estimator(model_version=None, feature_shift_method="shuffle"):
+    # one batched estimator per (version, feature_shift_method), built once and reused; callers
+    # swap weights via load_state_dict instead of re-fitting/reloading per surface (the old
+    # per-surface path was the bottleneck). feature_shift_method is an inference_config option
+    # (TabPFN's own feature-order-shuffle ensembling trick), not just a training knob - it also
+    # changes what a checkpoint sees at eval time, so it's part of the cache key like model_version.
+    global _eval_estimators
+    key = (model_version, feature_shift_method)
+    if key not in _eval_estimators:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        est = TabPFNRegressor(
+        common = dict(
             fit_mode="batched", n_estimators=1, device=device,
-            inference_config={"FINGERPRINT_FEATURE": False},
+            inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": feature_shift_method},
         )
+        if model_version is not None:
+            est = TabPFNRegressor.create_default_for_version(version=ModelVersion(model_version), **common)
+        else:
+            est = TabPFNRegressor(**common)
         est._initialize_model_variables()
         est.model_.to(device)
         est.model_.eval()
-        _pretrained_state = {k: v.detach().cpu().clone() for k, v in est.model_.state_dict().items()}
-        _eval_estimator = est
-    return _eval_estimator
+        pretrained_state = {k: v.detach().cpu().clone() for k, v in est.model_.state_dict().items()}
+        _eval_estimators[key] = (est, pretrained_state)
+    return _eval_estimators[key]
 
 
 @torch.no_grad()
@@ -77,11 +85,12 @@ def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
     return check_arbitrage(iv_flat.reshape(g.shape), g.ttms, g.zs, tol=tol)
 
 
-def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128):
+def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128, model_version=None,
+                   feature_shift_method="shuffle"):
     # `model` is ignored except as an API anchor; a shared batched estimator does the work.
     # reload_state=None evaluates the non-finetuned pretrained weights.
-    est = _get_eval_estimator()
-    est.model_.load_state_dict(reload_state if reload_state is not None else _pretrained_state)
+    est, pretrained_state = _get_eval_estimator(model_version, feature_shift_method)
+    est.model_.load_state_dict(reload_state if reload_state is not None else pretrained_state)
 
     rng = np.random.default_rng(0)
     # cap the forward batch so peak GPU memory stays bounded regardless of len(train_list);
@@ -116,7 +125,7 @@ def quantile_coverage(model, train_list, test_list, reload_state=None, levels=(0
     return {lv: float(np.mean(c)) for lv, c in coverages.items()}
 
 
-def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, group_size=8):
+def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, group_size=8, model_version=None):
     """Cell-level arb diagnostics on a single frozen arb grid, shared across every surface in
     `train_list` and reused as-is across eval runs/checkpoints (produced once via
     `sample_arb_grid`, see `run_finetuning.load_arb_grid`) - unlike training's grid, this one is
@@ -130,8 +139,8 @@ def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, gro
     surface than the native MAE grid, so peak memory grows much faster with batch size (see
     scripts/bench_arb_val_batch.py - group_size=32 already hits ~84GB, 64 OOMs on a 96GB card).
     """
-    est = _get_eval_estimator()
-    est.model_.load_state_dict(reload_state if reload_state is not None else _pretrained_state)
+    est, pretrained_state = _get_eval_estimator(model_version)
+    est.model_.load_state_dict(reload_state if reload_state is not None else pretrained_state)
 
     query = arb_rows.copy()
     query[:, 2] = 0.0
@@ -178,12 +187,12 @@ def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, gro
     return tuple(float(np.mean(x)) for x in (cell_fracs, mean_depths, worst_cells, arb_free))
 
 
-def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_size=64):
+def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_size=64, model_version=None):
     """Truth-free scoring for real quotes: MAE vs mid and inside-[bid,ask] fraction, at the
     held-out quote locations and at the context quotes. Expects `make_real_eval_set(..., cfg=None)`
     pairs: context X = [z, tau, side] (bids then asks), test = (held_rows, y_held (n, 2) [bid, ask])."""
-    est = _get_eval_estimator()
-    est.model_.load_state_dict(reload_state if reload_state is not None else _pretrained_state)
+    est, pretrained_state = _get_eval_estimator(model_version)
+    est.model_.load_state_dict(reload_state if reload_state is not None else pretrained_state)
 
     queries, targets = [], []
     for (X_tr, y_tr), (X_held, y_held) in zip(train_list, test_list):
