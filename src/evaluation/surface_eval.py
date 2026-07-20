@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from tabpfn import TabPFNRegressor
+from tabpfn.preprocessing import PreprocessorConfig
 from tabpfn.architectures.interface import PerformanceOptions
 from tabpfn.constants import ModelVersion
 
@@ -21,10 +22,11 @@ def _get_eval_estimator(model_version=None):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         common = dict(
             fit_mode="batched", n_estimators=1, device=device,
+            categorical_features_indices=[],
             inference_config={
                 "FINGERPRINT_FEATURE": False,
                 "FEATURE_SHIFT_METHOD": None,
-                "MIN_UNIQUE_FOR_NUMERICAL_FEATURES": 2,
+                "PREPROCESS_TRANSFORMS": [PreprocessorConfig("none", categorical_name="numeric")],
             },
         )
         if model_version is not None:
@@ -53,9 +55,11 @@ def _predict_raw(est, surfaces):
         _, per_estim_logits, _ = est.forward(s.X_query, use_inference_mode=False)
         logits_QBEL = torch.stack(per_estim_logits, dim=2)
         Q, B, E, L = logits_QBEL.shape
-        logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L).cpu()
+        logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
         for g in range(B):
-            iv = s.raw_bardists[g].mean(logits_BQL[g * E:(g + 1) * E]).mean(0)  # (Q,)
+            # bardist may live on the model's device (e.g. CUDA); keep the mean computation
+            # there and only move the final per-surface result to CPU for numpy conversion
+            iv = s.raw_bardists[g].mean(logits_BQL[g * E:(g + 1) * E]).mean(0).cpu()  # (Q,)
             preds.append((iv.numpy(), s.y_query_raw[g].numpy()))
     return preds
 
@@ -86,7 +90,8 @@ def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
     return check_arbitrage(iv_flat.reshape(g.shape), g.ttms, g.zs, tol=tol)
 
 
-def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128, model_version=None):
+def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128, model_version=None,
+                   iv_max=1.5):
     # `model` is ignored except as an API anchor; a shared batched estimator does the work.
     # reload_state=None evaluates the non-finetuned pretrained weights.
     est, pretrained_state = _get_eval_estimator(model_version)
@@ -95,7 +100,7 @@ def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_si
     rng = np.random.default_rng(0)
     # cap the forward batch so peak GPU memory stays bounded regardless of len(train_list);
     # ~16 same-shape surfaces peaks ~5 GiB, well under a 14.5 GiB card (scripts/probe_eval_batch.py)
-    surfaces = preprocess_surfaces(est, train_list, test_list, rng, group_size=group_size)
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size)
 
     maes, mapes, cal_violations, butterfly_violations = [], [], [], []
     for y_pred, y_te in _predict_raw(est, surfaces):
@@ -125,7 +130,8 @@ def quantile_coverage(model, train_list, test_list, reload_state=None, levels=(0
     return {lv: float(np.mean(c)) for lv, c in coverages.items()}
 
 
-def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, group_size=8, model_version=None):
+def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, group_size=8, model_version=None,
+                         iv_max=1.5):
     """Cell-level arb diagnostics on a single frozen arb grid, shared across every surface in
     `train_list` and reused as-is across eval runs/checkpoints (produced once via
     `sample_arb_grid`, see `run_finetuning.load_arb_grid`) - unlike training's grid, this one is
@@ -146,7 +152,7 @@ def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, gro
     query[:, 2] = 0.0
     test_list = [(query, np.zeros(len(query)))] * len(train_list)  # y unused, pred-only query
     rng = np.random.default_rng(0)
-    surfaces = preprocess_surfaces(est, train_list, test_list, rng, group_size=group_size)
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size)
 
     n_zb, n_rc, n_zc = arb_grid_shape(cfg)
     n_cal = (n_rc - 1) * n_zc
@@ -187,7 +193,8 @@ def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, gro
     return tuple(float(np.mean(x)) for x in (cell_fracs, mean_depths, worst_cells, arb_free))
 
 
-def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_size=64, model_version=None):
+def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_size=64, model_version=None,
+                        iv_max=1.5):
     """Truth-free scoring for real quotes: MAE vs mid and inside-[bid,ask] fraction, at the
     held-out quote locations and at the context quotes. Expects `make_real_eval_set(..., cfg=None)`
     pairs: context X = [z, tau, side] (bids then asks), test = (held_rows, y_held (n, 2) [bid, ask])."""
@@ -206,7 +213,7 @@ def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_si
         targets.append((nc, bid, ask))
 
     rng = np.random.default_rng(0)
-    surfaces = preprocess_surfaces(est, train_list, queries, rng, group_size=group_size)
+    surfaces = preprocess_surfaces(est, train_list, queries, rng, iv_max, group_size=group_size)
 
     out = {k: [] for k in ("mae_held", "inside_held", "mae_ctx", "inside_ctx")}
     for (pred, _), (nc, bid, ask) in zip(_predict_raw(est, surfaces), targets):

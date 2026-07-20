@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import yaml
 from tabpfn import TabPFNRegressor
+from tabpfn.preprocessing import PreprocessorConfig
 from tabpfn.constants import ModelVersion
 
 from src.data_generation.grid import Grid, sample_arb_grid, z_to_k
@@ -134,9 +135,10 @@ def load_val(experiment, cfg, rebuild=False, rho=0.0):
 
 
 def load_finetuned(run_name, device, which="final", model_version=None):
-    common = dict(fit_mode="fit_preprocessors", n_estimators=1, inference_config={
+    common = dict(fit_mode="fit_preprocessors", n_estimators=1, categorical_features_indices=[], inference_config={
         "FINGERPRINT_FEATURE": False,
-        "MIN_UNIQUE_FOR_NUMERICAL_FEATURES": 2,
+        "FEATURE_SHIFT_METHOD": None,
+        "PREPROCESS_TRANSFORMS": [PreprocessorConfig("none", categorical_name="numeric")],
     })
     if model_version is not None:
         model = TabPFNRegressor.create_default_for_version(version=ModelVersion(model_version), **common)
@@ -245,12 +247,13 @@ def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, 
     for i, (m, n_ctx) in enumerate(slots, 1):
         tr, te = eval_set[m][n_ctx]
         print(f"[{i}/{len(slots)}] regime={m} n_ctx={n_ctx} ...", flush=True)
-        mae, mape, cal, bf = eval_surfaces(model, tr, te, cfg, reload_state=state, model_version=model_version)
+        mae, mape, cal, bf = eval_surfaces(model, tr, te, cfg, reload_state=state, model_version=model_version,
+                                            iv_max=cfg["iv_max"])
         results.setdefault(str(m), {})[n_ctx] = dict(
             mae=float(mae), mape=float(mape), cal_viol=float(cal), bf_viol=float(bf))
 
         cell_frac, mean_depth, worst_cell, arb_free = eval_arbitrage_fine(
-            model, tr, cfg, arb_rows, reload_state=state, model_version=model_version)
+            model, tr, cfg, arb_rows, reload_state=state, model_version=model_version, iv_max=cfg["iv_max"])
         arb_results.setdefault(str(m), {})[n_ctx] = dict(
             cell_frac=float(cell_frac), mean_depth=float(mean_depth),
             worst_cell=float(worst_cell), arb_free=float(arb_free))
@@ -316,7 +319,7 @@ def main():
             data_provider, run_name=run_name, n_epochs=args.epochs,
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size or spec["batch_size"],
             group_size=args.group_size or spec["group_size"], val_group_size=spec["val_group_size"],
-            val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
+            val_data=val_data, val_every=args.val_every, iv_max=cfg["iv_max"], loss_fn=loss_fn, device=args.device,
             wandb_project=args.wandb_project or None, wandb_entity=args.wandb_entity,
             from_scratch=args.from_scratch, lr=args.lr, init_state=init_state,
             model_version=args.model_version,

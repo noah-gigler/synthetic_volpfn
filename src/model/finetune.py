@@ -16,6 +16,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from tabpfn import TabPFNRegressor
+from tabpfn.preprocessing import PreprocessorConfig
 from tabpfn.architectures.interface import PerformanceOptions
 from tabpfn.constants import ModelVersion
 from tabpfn.finetuning.finetuned_regressor import _compute_regression_loss
@@ -129,6 +130,7 @@ def finetune(
     n_val_surfaces: int = 5,
     val_data: tuple[list, list] | None = None,
     val_every: int = 1,
+    iv_max: float = 1.5,
     loss_fn=None,
     lr: float = 1e-5,
     weight_decay: float = 0.01,
@@ -171,10 +173,13 @@ def finetune(
         fit_mode="batched",
         n_estimators=1,  # required for training stability, see CLAUDE.md
         device=device,
+        # our features are 2-3 fixed-scale columns; skip TabPFN's foundation-model
+        # normalization (squashing/SVD/fingerprint/shift) and feed [z, tau, side] raw
+        categorical_features_indices=[],
         inference_config={
             "FINGERPRINT_FEATURE": False,
             "FEATURE_SHIFT_METHOD": None,
-            "MIN_UNIQUE_FOR_NUMERICAL_FEATURES": 2,
+            "PREPROCESS_TRANSFORMS": [PreprocessorConfig("none", categorical_name="numeric")],
         },
     )
     if model_version is not None:
@@ -238,7 +243,7 @@ def finetune(
     val_surfaces = None
     if val_train is not None:
         val_surfaces = preprocess_surfaces(
-            estimator, val_train, val_test, rng, group_size=val_group_size or group_size)
+            estimator, val_train, val_test, rng, iv_max, group_size=val_group_size or group_size)
         val_sizes = [len(y_ctx) for _, y_ctx in val_train]
 
     log.info(
@@ -249,7 +254,7 @@ def finetune(
     for epoch in range(n_epochs):
         train, test = data_provider(n_surfaces_per_epoch)
 
-        surfaces = preprocess_surfaces(estimator, train, test, rng, group_size=group_size)
+        surfaces = preprocess_surfaces(estimator, train, test, rng, iv_max, group_size=group_size)
         rng.shuffle(surfaces)  # shuffles groups; surfaces within a group stay together
         train_losses, train_parts = _run_pass(
             estimator, surfaces, perf_opts, device,
