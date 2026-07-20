@@ -9,22 +9,19 @@ from src.data_generation.grid import Grid, arb_grid_shape
 from src.model.preprocessed_dataset import preprocess_surfaces
 
 _PERF = PerformanceOptions(force_recompute_layer=False, use_chunkwise_inference=False)
-_eval_estimators: dict = {}  # (model_version, feature_shift_method) -> (estimator, pretrained_state)
+_eval_estimators: dict = {}  # model_version -> (estimator, pretrained_state)
 
 
-def _get_eval_estimator(model_version=None, feature_shift_method="shuffle"):
-    # one batched estimator per (version, feature_shift_method), built once and reused; callers
-    # swap weights via load_state_dict instead of re-fitting/reloading per surface (the old
-    # per-surface path was the bottleneck). feature_shift_method is an inference_config option
-    # (TabPFN's own feature-order-shuffle ensembling trick), not just a training knob - it also
-    # changes what a checkpoint sees at eval time, so it's part of the cache key like model_version.
+def _get_eval_estimator(model_version=None):
+    # one batched estimator per version, built once and reused; callers swap weights via
+    # load_state_dict instead of re-fitting/reloading per surface (the old per-surface path
+    # was the bottleneck).
     global _eval_estimators
-    key = (model_version, feature_shift_method)
-    if key not in _eval_estimators:
+    if model_version not in _eval_estimators:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         common = dict(
             fit_mode="batched", n_estimators=1, device=device,
-            inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": feature_shift_method},
+            inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": None},
         )
         if model_version is not None:
             est = TabPFNRegressor.create_default_for_version(version=ModelVersion(model_version), **common)
@@ -34,8 +31,8 @@ def _get_eval_estimator(model_version=None, feature_shift_method="shuffle"):
         est.model_.to(device)
         est.model_.eval()
         pretrained_state = {k: v.detach().cpu().clone() for k, v in est.model_.state_dict().items()}
-        _eval_estimators[key] = (est, pretrained_state)
-    return _eval_estimators[key]
+        _eval_estimators[model_version] = (est, pretrained_state)
+    return _eval_estimators[model_version]
 
 
 @torch.no_grad()
@@ -85,11 +82,10 @@ def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
     return check_arbitrage(iv_flat.reshape(g.shape), g.ttms, g.zs, tol=tol)
 
 
-def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128, model_version=None,
-                   feature_shift_method="shuffle"):
+def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128, model_version=None):
     # `model` is ignored except as an API anchor; a shared batched estimator does the work.
     # reload_state=None evaluates the non-finetuned pretrained weights.
-    est, pretrained_state = _get_eval_estimator(model_version, feature_shift_method)
+    est, pretrained_state = _get_eval_estimator(model_version)
     est.model_.load_state_dict(reload_state if reload_state is not None else pretrained_state)
 
     rng = np.random.default_rng(0)

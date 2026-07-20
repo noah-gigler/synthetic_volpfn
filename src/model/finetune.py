@@ -138,7 +138,6 @@ def finetune(
     seed: int = 0,
     wandb_project: str | None = None,
     wandb_entity: str | None = None,
-    feature_shift_method: str | None = "shuffle",
     init_state: dict | None = None,
     from_scratch: bool = False,
     model_version: str | None = None,
@@ -172,7 +171,7 @@ def finetune(
         fit_mode="batched",
         n_estimators=1,  # required for training stability, see CLAUDE.md
         device=device,
-        inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": feature_shift_method},
+        inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": None},
     )
     if model_version is not None:
         # create_default_for_version's own defaults (n_estimators=8, softmax_temperature=0.9)

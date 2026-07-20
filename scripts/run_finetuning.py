@@ -283,8 +283,6 @@ def main():
                     help="CPU workers for the SSVI baseline refit (default: os.cpu_count())")
     p.add_argument("--wandb-project", default="volpfn", help="W&B project name (empty string to disable)")
     p.add_argument("--wandb-entity", default="volpfn", help="W&B team/entity name")
-    p.add_argument("--feature-shift-method", default="shuffle", choices=["shuffle", "rotate", "none"],
-                    help="TabPFN ensemble feature-position shift ('none' disables it)")
     p.add_argument("--from-scratch", action="store_true",
                     help="randomize the pretrained TabPFN weights before training instead of "
                          "finetuning from them - needs a much higher --lr than the finetuning default")
@@ -317,7 +315,6 @@ def main():
             group_size=args.group_size or spec["group_size"], val_group_size=spec["val_group_size"],
             val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
             wandb_project=args.wandb_project or None, wandb_entity=args.wandb_entity,
-            feature_shift_method=None if args.feature_shift_method == "none" else args.feature_shift_method,
             from_scratch=args.from_scratch, lr=args.lr, init_state=init_state,
             model_version=args.model_version,
         )
