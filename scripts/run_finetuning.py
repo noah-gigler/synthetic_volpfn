@@ -134,7 +134,10 @@ def load_val(experiment, cfg, rebuild=False, rho=0.0):
 
 
 def load_finetuned(run_name, device, which="final", model_version=None):
-    common = dict(fit_mode="fit_preprocessors", n_estimators=1, inference_config={"FINGERPRINT_FEATURE": False})
+    common = dict(fit_mode="fit_preprocessors", n_estimators=1, inference_config={
+        "FINGERPRINT_FEATURE": False,
+        "MIN_UNIQUE_FOR_NUMERICAL_FEATURES": 2,
+    })
     if model_version is not None:
         model = TabPFNRegressor.create_default_for_version(version=ModelVersion(model_version), **common)
     else:

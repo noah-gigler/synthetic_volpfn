@@ -171,7 +171,11 @@ def finetune(
         fit_mode="batched",
         n_estimators=1,  # required for training stability, see CLAUDE.md
         device=device,
-        inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": None},
+        inference_config={
+            "FINGERPRINT_FEATURE": False,
+            "FEATURE_SHIFT_METHOD": None,
+            "MIN_UNIQUE_FOR_NUMERICAL_FEATURES": 2,
+        },
     )
     if model_version is not None:
         # create_default_for_version's own defaults (n_estimators=8, softmax_temperature=0.9)

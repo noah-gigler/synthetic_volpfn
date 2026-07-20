@@ -21,7 +21,11 @@ def _get_eval_estimator(model_version=None):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         common = dict(
             fit_mode="batched", n_estimators=1, device=device,
-            inference_config={"FINGERPRINT_FEATURE": False, "FEATURE_SHIFT_METHOD": None},
+            inference_config={
+                "FINGERPRINT_FEATURE": False,
+                "FEATURE_SHIFT_METHOD": None,
+                "MIN_UNIQUE_FOR_NUMERICAL_FEATURES": 2,
+            },
         )
         if model_version is not None:
             est = TabPFNRegressor.create_default_for_version(version=ModelVersion(model_version), **common)
