@@ -2,22 +2,31 @@
 # skipping tabpfn.finetuning.data_util's generic split_fn/chunking machinery since we don't need it.
 # Preprocessing-config selection is based on context size alone
 
+from pathlib import Path
+
 import numpy as np
 import torch
+import yaml
 
 from tabpfn.architectures.base.bar_distribution import BarDistribution
 from tabpfn.finetuning.data_util import RegressorBatch
 from tabpfn.preprocessing.datamodel import FeatureModality
 from tabpfn.preprocessing.ensemble import TabPFNEnsemblePreprocessor
 
+_cfg = yaml.safe_load(open(Path(__file__).resolve().parents[2] / "config.yaml"))
+Y_MEAN, Y_SCALE = _cfg["y_mean"], _cfg["y_scale"]
+
 
 def preprocess_surfaces(estimator, train, test, rng: np.random.Generator, iv_max: float, group_size: int = 1) -> list[RegressorBatch]:
     """One RegressorBatch per group of up to `group_size` consecutive surfaces with equal
     context shape (stacked along the dataset-batch dim -> one forward pass per group).
 
-    Targets and the bar distribution live in raw IV space: a single fixed
-    `BarDistribution` over [0, iv_max] shared by every surface (positive by construction,
-    same scale everywhere), instead of a per-surface z-normalized one.
+    The bar distribution lives in a global z-normed space (y - Y_MEAN) / Y_SCALE - same fixed
+    range for every surface (unlike the old per-surface znorm), fixing a gradient-conditioning
+    problem raw-IV targets had (values ~0.1-0.3 made Adam's eps non-negligible, degrading long
+    runs - see notes/results_summary.md). `raw_bardist` is the same bucket structure with
+    borders mapped back to real IV (`* Y_SCALE + Y_MEAN`), for callers that need real units
+    (arb/butterfly physics, MAE/eval) - `.mean()`/`.icdf()` on it decode automatically.
 
     `train`/`test` are the lists returned by a `data_provider`, i.e.
     `list[(X_context, y_context)]` and `list[(X_query, y_query)]`.
@@ -27,10 +36,13 @@ def preprocess_surfaces(estimator, train, test, rng: np.random.Generator, iv_max
 
     device = next(estimator.model_.parameters()).device
     n_bars = estimator.znorm_space_bardist_.borders.shape[0] - 1
-    bardist = BarDistribution(torch.linspace(0.0, iv_max, n_bars + 1)).float().to(device)
+    znorm_borders = torch.linspace((0.0 - Y_MEAN) / Y_SCALE, (iv_max - Y_MEAN) / Y_SCALE, n_bars + 1)
+    znorm_bardist = BarDistribution(znorm_borders).float().to(device)
+    raw_bardist = BarDistribution(znorm_borders * Y_SCALE + Y_MEAN).float().to(device)
 
     built = []
     for (X_context, y_context), (X_query_raw, y_query_raw) in zip(train, test):
+        y_context = (y_context - Y_MEAN) / Y_SCALE
         ensemble_configs, X_context, y_context, _ = estimator._initialize_dataset_preprocessing(
             X=X_context, y=y_context, random_state=rng,
         )
@@ -56,11 +68,11 @@ def preprocess_surfaces(estimator, train, test, rng: np.random.Generator, iv_max
             "X_context": [t(m.X_train) for m in members],
             "X_query": [t(m.transform_X_test(X_query_raw)) for m in members],
             "y_context": [t(m.y_train) for m in members],
-            "y_query": t(y_query_raw),
+            "y_query": t((y_query_raw - Y_MEAN) / Y_SCALE),
             "cat_indices": [m.feature_schema.indices_for(FeatureModality.CATEGORICAL) for m in members],
             "configs": list(ensemble_configs),
-            "raw_bardist": bardist,
-            "znorm_bardist": bardist,
+            "raw_bardist": raw_bardist,
+            "znorm_bardist": znorm_bardist,
             "X_query_raw": t_cpu(X_query_raw),
             "y_query_raw": t_cpu(y_query_raw),
         })
