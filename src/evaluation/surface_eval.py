@@ -41,26 +41,35 @@ def _get_eval_estimator(model_version=None):
     return _eval_estimators[model_version]
 
 
-@torch.no_grad()
+def _forward_logits(est, surfaces):
+    # yields (raw_bardist, logits (E,Q,L), y_query_raw (Q,)) per surface, in input order;
+    # shared by every eval metric that needs the predictive distribution, not just its mean.
+    # torch.no_grad() wraps the loop body, not the function - a decorator on a generator
+    # function only guards the call that creates the generator, not each lazily-run `next()`
+    with torch.no_grad():
+        for s in surfaces:
+            est.raw_space_bardist_ = s.raw_space_bardist
+            est.znorm_space_bardist_ = s.znorm_space_bardist
+            est.fit_from_preprocessed(
+                s.X_context, s.y_context, s.cat_indices, s.configs,
+                performance_options=_PERF, no_refit=True,
+            )
+            _, per_estim_logits, _ = est.forward(s.X_query, use_inference_mode=False)
+            logits_QBEL = torch.stack(per_estim_logits, dim=2)
+            Q, B, E, L = logits_QBEL.shape
+            logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
+            for g in range(B):
+                yield s.raw_bardists[g], logits_BQL[g * E:(g + 1) * E], s.y_query_raw[g]
+
+
 def _predict_raw(est, surfaces):
     # raw-space IV mean per surface, in the input surface order (groups preserve order)
     preds = []
-    for s in surfaces:
-        est.raw_space_bardist_ = s.raw_space_bardist
-        est.znorm_space_bardist_ = s.znorm_space_bardist
-        est.fit_from_preprocessed(
-            s.X_context, s.y_context, s.cat_indices, s.configs,
-            performance_options=_PERF, no_refit=True,
-        )
-        _, per_estim_logits, _ = est.forward(s.X_query, use_inference_mode=False)
-        logits_QBEL = torch.stack(per_estim_logits, dim=2)
-        Q, B, E, L = logits_QBEL.shape
-        logits_BQL = logits_QBEL.permute(1, 2, 0, 3).reshape(B * E, Q, L)
-        for g in range(B):
-            # bardist may live on the model's device (e.g. CUDA); keep the mean computation
-            # there and only move the final per-surface result to CPU for numpy conversion
-            iv = s.raw_bardists[g].mean(logits_BQL[g * E:(g + 1) * E]).mean(0).cpu()  # (Q,)
-            preds.append((iv.numpy(), s.y_query_raw[g].numpy()))
+    for bardist, logits_EQL, y_query_raw in _forward_logits(est, surfaces):
+        # bardist may live on the model's device (e.g. CUDA); keep the mean computation
+        # there and only move the final per-surface result to CPU for numpy conversion
+        iv = bardist.mean(logits_EQL).mean(0).cpu()  # (Q,)
+        preds.append((iv.numpy(), y_query_raw.numpy()))
     return preds
 
 
@@ -131,8 +140,69 @@ def quantile_coverage(model, train_list, test_list, reload_state=None, levels=(0
     return {lv: float(np.mean(c)) for lv, c in coverages.items()}
 
 
+def eval_uncertainty(model, train_list, test_list, reload_state=None, group_size=128, model_version=None,
+                      iv_max=1.5, y_mean=0.300, y_scale=0.135, feature_scale=None,
+                      pinball_levels=(0.05, 0.95), interval_level=0.90, n_crps_quantiles=39):
+    """Predictive-distribution calibration: CRPS, pinball loss, central-interval width, and PIT
+    values, all read off the bar distribution's own `cdf`/`icdf` - no extra model output needed,
+    same batched forward pass as `eval_surfaces`. CRPS has no closed form for a piecewise-uniform
+    bar distribution, so it's estimated via the standard quantile-average identity
+    `CRPS(F,y) = 2 * E_tau~U(0,1)[pinball_tau(y, F^-1(tau))]` (Gneiting & Raftery 2007) on a
+    `n_crps_quantiles`-point grid. PIT values should be ~Uniform(0,1) under good calibration -
+    return the raw array so callers can plot a PIT histogram.
+    """
+    est, pretrained_state = _get_eval_estimator(model_version)
+    est.model_.load_state_dict(reload_state if reload_state is not None else pretrained_state)
+
+    rng = np.random.default_rng(0)
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size,
+                                     y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
+
+    tau_grid = (np.arange(n_crps_quantiles) + 0.5) / n_crps_quantiles  # midpoint rule, avoids tau=0,1
+    lo_level, hi_level = (1 - interval_level) / 2, 1 - (1 - interval_level) / 2
+
+    crps_all, pit_all = [], []
+    pinball_all = {lv: [] for lv in pinball_levels}
+    widths_all = []
+    for bardist, logits_EQL, y_query_raw in _forward_logits(est, surfaces):
+        y = y_query_raw.to(logits_EQL.device)  # (Q,)
+
+        def icdf_ens(level):
+            # average the per-estimator quantile prediction across the ensemble (E=1 in
+            # practice, since finetune.py fixes n_estimators=1 - see CLAUDE.md)
+            return torch.stack([bardist.icdf(logits_EQL[e], level) for e in range(logits_EQL.shape[0])], 0).mean(0)
+
+        def pinball(level, q_pred):
+            diff = y - q_pred
+            return torch.maximum(level * diff, (level - 1) * diff)
+
+        # bardist.cdf's 1-D-ys branch broadcasts ys as points *shared* across the batch dim,
+        # not one-per-row - our y is one-per-row and happens to share Q's length, so an
+        # unsqueezed trailing dim is needed to hit its positional (asserted-shape) branch instead
+        pit = torch.stack(
+            [bardist.cdf(logits_EQL[e], y.unsqueeze(-1)).squeeze(-1) for e in range(logits_EQL.shape[0])], 0,
+        ).mean(0)
+        pit_all.append(pit.cpu().numpy())
+
+        lo, hi = icdf_ens(lo_level), icdf_ens(hi_level)
+        widths_all.append((hi - lo).cpu().numpy())
+
+        for lv in pinball_levels:
+            pinball_all[lv].append(pinball(lv, icdf_ens(lv)).cpu().numpy())
+
+        crps_terms = torch.stack([pinball(tau, icdf_ens(tau)) for tau in tau_grid], 0)  # (n_crps_quantiles, Q)
+        crps_all.append((2 * crps_terms.mean(0)).cpu().numpy())
+
+    return dict(
+        crps=float(np.mean(np.concatenate(crps_all))),
+        pinball={lv: float(np.mean(np.concatenate(v))) for lv, v in pinball_all.items()},
+        mean_interval_width=float(np.mean(np.concatenate(widths_all))),
+        pit=np.concatenate(pit_all),
+    )
+
+
 def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, group_size=8, model_version=None,
-                         iv_max=1.5):
+                         iv_max=1.5, y_mean=0.300, y_scale=0.135, feature_scale=None):
     """Cell-level arb diagnostics on a single frozen arb grid, shared across every surface in
     `train_list` and reused as-is across eval runs/checkpoints (produced once via
     `sample_arb_grid`, see `run_finetuning.load_arb_grid`) - unlike training's grid, this one is

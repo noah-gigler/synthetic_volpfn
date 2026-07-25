@@ -21,7 +21,7 @@ from src.data_generation.noise import (
 from src.model.finetune import finetune
 from src.model.quote_loss import quote_arb_loss
 from src.model.SSVI import fit_ssvi, predict_ssvi
-from src.evaluation.surface_eval import eval_arbitrage_fine, eval_surfaces
+from src.evaluation.surface_eval import eval_arbitrage_fine, eval_surfaces, eval_uncertainty
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "datasets"
@@ -213,7 +213,7 @@ def load_baselines(cfg, eval_set, rebuild=False, n_jobs=None, rho=0.0):
     return base
 
 
-def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines):
+def _write_eval_txt(path, run_name, which, rho, results, arb_results, uq_results, baselines):
     lines = [f"{run_name} ({which}.pt), rho={rho}"]
 
     for m, rows in results.items():
@@ -232,38 +232,55 @@ def _write_eval_txt(path, run_name, which, rho, results, arb_results, baselines)
             lines.append(f"{n_ctx:>6} {r['cell_frac']*100:>8.2f}% {r['mean_depth']:>11.4f}"
                          f" {r['worst_cell']:>11.4f} {r['arb_free']*100:>9.1f}%")
 
+    lines.append("\n\nUncertainty (predictive-distribution calibration, see eval_uncertainty)")
+    for m, rows in uq_results.items():
+        lines.append(f"\n=== regime m={m} ===")
+        lines.append(f"{'n_ctx':>6} {'CRPS':>8} {'pinball05':>10} {'pinball95':>10} {'width90%':>9}")
+        for n_ctx, r in rows.items():
+            lines.append(f"{n_ctx:>6} {r['crps']:>8.4f} {r['pinball'][0.05]:>10.4f}"
+                         f" {r['pinball'][0.95]:>10.4f} {r['mean_interval_width']:>9.4f}")
+
     open(path, "w").write("\n".join(lines) + "\n")
 
 
 def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, baseline_jobs=None,
-             model_version=None):
+             model_version=None, y_mean=0.300, y_scale=0.135, feature_scale=None):
     # matched-rho eval: a model trained on correlated quote noise (rho!=0) should be evaluated
     # against noise drawn the same way, not the default iid (rho=0) set - see notes/results_summary.md
     eval_set = load_eval(cfg, rebuild=rebuild_eval, rho=rho)
     arb_rows = load_arb_grid(cfg, rebuild=rebuild_eval)
     model, state = load_finetuned(run_name, device, which=which, model_version=model_version)
-    results, arb_results = {}, {}
+    results, arb_results, uq_results, pit_arrays = {}, {}, {}, {}
     slots = [(m, n_ctx) for m, by_ctx in eval_set.items() for n_ctx in by_ctx]
     for i, (m, n_ctx) in enumerate(slots, 1):
         tr, te = eval_set[m][n_ctx]
         print(f"[{i}/{len(slots)}] regime={m} n_ctx={n_ctx} ...", flush=True)
         mae, mape, cal, bf = eval_surfaces(model, tr, te, cfg, reload_state=state, model_version=model_version,
-                                            iv_max=cfg["iv_max"])
+                                            iv_max=cfg["iv_max"], y_mean=y_mean, y_scale=y_scale,
+                                            feature_scale=feature_scale)
         results.setdefault(str(m), {})[n_ctx] = dict(
             mae=float(mae), mape=float(mape), cal_viol=float(cal), bf_viol=float(bf))
 
         cell_frac, mean_depth, worst_cell, arb_free = eval_arbitrage_fine(
-            model, tr, cfg, arb_rows, reload_state=state, model_version=model_version, iv_max=cfg["iv_max"])
+            model, tr, cfg, arb_rows, reload_state=state, model_version=model_version, iv_max=cfg["iv_max"],
+            y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
         arb_results.setdefault(str(m), {})[n_ctx] = dict(
             cell_frac=float(cell_frac), mean_depth=float(mean_depth),
             worst_cell=float(worst_cell), arb_free=float(arb_free))
 
+        uq = eval_uncertainty(model, tr, te, reload_state=state, model_version=model_version,
+                               iv_max=cfg["iv_max"], y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
+        uq_results.setdefault(str(m), {})[n_ctx] = dict(
+            crps=uq["crps"], pinball=uq["pinball"], mean_interval_width=uq["mean_interval_width"])
+        pit_arrays[f"{m}_{n_ctx}"] = uq["pit"]
+
     baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval, n_jobs=baseline_jobs, rho=rho)
 
     out_dir = ROOT / "checkpoints" / run_name
-    json.dump(dict(mae=results, arb=arb_results), open(out_dir / "eval.json", "w"), indent=2)
-    _write_eval_txt(out_dir / "eval.txt", run_name, which, rho, results, arb_results, baselines)
-    print(f"\nsaved eval -> {out_dir/'eval.json'}  and  {out_dir/'eval.txt'}")
+    json.dump(dict(mae=results, arb=arb_results, uq=uq_results), open(out_dir / "eval.json", "w"), indent=2)
+    np.savez(out_dir / "pit.npz", **pit_arrays)
+    _write_eval_txt(out_dir / "eval.txt", run_name, which, rho, results, arb_results, uq_results, baselines)
+    print(f"\nsaved eval -> {out_dir/'eval.json'}, {out_dir/'eval.txt'}, and {out_dir/'pit.npz'} (PIT histogram data)")
     print(open(out_dir / "eval.txt").read())
 
 
@@ -300,6 +317,14 @@ def main():
                     help="TabPFN checkpoint version (default: current package default, v3). "
                          "Must already be cached (~/.cache/tabpfn) before running on a compute "
                          "node with no internet - see scripts/predownload_tabpfn.py")
+    p.add_argument("--which", default="final", choices=["final", "best"],
+                    help="checkpoint to evaluate with --eval-only")
+    p.add_argument("--feature-zscore", action="store_true",
+                    help="also z-score z/tau input features globally (cfg's z_mean/z_scale/"
+                         "tau_mean/tau_scale) - off by default, features are fed raw")
+    p.add_argument("--global-squashing", action="store_true",
+                    help="robust median/IQR global rescale for y AND z/tau (cfg's *_median/*_iqr) "
+                         "instead of mean/std - no clip (z/tau are already domain-bounded)")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
@@ -307,6 +332,13 @@ def main():
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
 
     rho = args.rho[0] if len(args.rho) == 1 else tuple(args.rho)
+    y_mean, y_scale = cfg["y_mean"], cfg["y_scale"]
+    feature_scale = None
+    if args.global_squashing:
+        y_mean, y_scale = cfg["y_median"], cfg["y_iqr"]
+        feature_scale = (cfg["z_median"], cfg["z_iqr"], cfg["tau_median"], cfg["tau_iqr"])
+    elif args.feature_zscore:
+        feature_scale = (cfg["z_mean"], cfg["z_scale"], cfg["tau_mean"], cfg["tau_scale"])
 
     if not args.eval_only:
         val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=rho)
@@ -319,14 +351,17 @@ def main():
             data_provider, run_name=run_name, n_epochs=args.epochs,
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size or spec["batch_size"],
             group_size=args.group_size or spec["group_size"], val_group_size=spec["val_group_size"],
-            val_data=val_data, val_every=args.val_every, iv_max=cfg["iv_max"], loss_fn=loss_fn, device=args.device,
+            val_data=val_data, val_every=args.val_every, iv_max=cfg["iv_max"],
+            y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale,
+            loss_fn=loss_fn, device=args.device,
             wandb_project=args.wandb_project or None, wandb_entity=args.wandb_entity,
             from_scratch=args.from_scratch, lr=args.lr, init_state=init_state,
             model_version=args.model_version,
         )
 
-    run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval,
-             baseline_jobs=args.baseline_jobs, rho=rho, model_version=args.model_version)
+    run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval, which=args.which,
+             baseline_jobs=args.baseline_jobs, rho=rho, model_version=args.model_version,
+             y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
 
 
 if __name__ == "__main__":
