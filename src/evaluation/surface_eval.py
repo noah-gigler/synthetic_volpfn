@@ -201,6 +201,45 @@ def eval_uncertainty(model, train_list, test_list, reload_state=None, group_size
     )
 
 
+def predict_interval(model, train_list, test_list, reload_state=None, group_size=128, model_version=None,
+                      iv_max=1.5, y_mean=0.300, y_scale=0.135, feature_scale=None, level=0.90):
+    """Per-query (lo, hi, y_true) arrays for the central `level` predictive interval, read off
+    icdf. Building block for conformal calibration - kept separate from `eval_uncertainty` since
+    conformal calibration needs raw per-point values, not aggregated summary stats: fit a
+    correction on one (calibration) set via `conformal_correction`, apply it to a *different*
+    (held-out) set's own lo/hi from this function."""
+    est, pretrained_state = _get_eval_estimator(model_version)
+    est.model_.load_state_dict(reload_state if reload_state is not None else pretrained_state)
+
+    rng = np.random.default_rng(0)
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size,
+                                     y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
+    lo_level, hi_level = (1 - level) / 2, 1 - (1 - level) / 2
+
+    los, his, ys = [], [], []
+    for bardist, logits_EQL, y_query_raw in _forward_logits(est, surfaces):
+        y = y_query_raw.to(logits_EQL.device)
+
+        def icdf_ens(lv):
+            return torch.stack([bardist.icdf(logits_EQL[e], lv) for e in range(logits_EQL.shape[0])], 0).mean(0)
+
+        los.append(icdf_ens(lo_level).cpu().numpy())
+        his.append(icdf_ens(hi_level).cpu().numpy())
+        ys.append(y.cpu().numpy())
+    return np.concatenate(los), np.concatenate(his), np.concatenate(ys)
+
+
+def conformal_correction(lo, hi, y, alpha=0.10):
+    """Split-conformal (CQR, Romano et al. 2019) additive correction Q: applying
+    `[lo - Q, hi + Q]` to a set *disjoint* from the one Q was fit on achieves >= 1-alpha
+    marginal coverage regardless of the base model's miscalibration direction (over- or
+    under-confident) - a model-agnostic post-hoc fix, no retraining needed."""
+    scores = np.maximum(lo - y, y - hi)
+    n = len(scores)
+    q_level = min(1.0, np.ceil((n + 1) * (1 - alpha)) / n)
+    return float(np.quantile(scores, q_level))
+
+
 def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, group_size=8, model_version=None,
                          iv_max=1.5, y_mean=0.300, y_scale=0.135, feature_scale=None):
     """Cell-level arb diagnostics on a single frozen arb grid, shared across every surface in
