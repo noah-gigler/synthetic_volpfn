@@ -18,7 +18,7 @@ from src.data_generation.noise import (
     make_noisy_stratified_eval_set, make_quote_eval_set,
     noisy_data_preparation, quote_data_preparation,
 )
-from src.model.finetune import finetune
+from src.model.finetune import finetune, crps_only_loss
 from src.model.quote_loss import quote_arb_loss
 from src.model.SSVI import fit_ssvi, predict_ssvi
 from src.evaluation.surface_eval import eval_arbitrage_fine, eval_surfaces, eval_uncertainty
@@ -325,6 +325,12 @@ def main():
     p.add_argument("--global-squashing", action="store_true",
                     help="robust median/IQR global rescale for y AND z/tau (cfg's *_median/*_iqr) "
                          "instead of mean/std - no clip (z/tau are already domain-bounded)")
+    p.add_argument("--crps-only", action="store_true",
+                    help="drop the default loss's mse_loss_weight=1.0 term (mean-only, no "
+                         "calibration signal) and train on crps_loss_weight=1.0 alone - tests "
+                         "whether the MSE term was diluting CRPS's pressure toward a calibrated "
+                         "predictive distribution (see report_notes.md PIT investigation). Only "
+                         "applies to the supervised experiment (arb already uses its own loss_fn).")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
@@ -343,7 +349,7 @@ def main():
     if not args.eval_only:
         val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=rho)
         data_provider = spec["provider"](cfg, tuple(args.n_context), rho)
-        loss_fn = spec["loss"](cfg)
+        loss_fn = crps_only_loss if args.crps_only else spec["loss"](cfg)
         init_state = None
         if args.init_from is not None:
             init_state = torch.load(ROOT / "checkpoints" / args.init_from / "final.pt", map_location=args.device)

@@ -29,6 +29,29 @@ log = logging.getLogger(__name__)
 
 DataProvider = Callable[[int], tuple[list[tuple[np.ndarray, np.ndarray]], list[tuple[np.ndarray, np.ndarray]]]]
 
+
+def crps_only_loss(estimator, surface, logits_BQL):
+    # same as the default loss_fn=None path in _run_pass, but mse_loss_weight=0 - isolates
+    # whether the mean-only MSE term (which carries no calibration signal) was diluting the
+    # CRPS term's pressure toward a calibrated predictive distribution (see notes/results_summary.md
+    # PIT calibration investigation: overconfident at small n_ctx, underconfident at large n_ctx)
+    device = logits_BQL.device
+    G = surface.y_query.shape[0]
+    E = logits_BQL.shape[0] // G
+    znorm_bardists = getattr(surface, "znorm_bardists", [surface.znorm_space_bardist] * G)
+    per_surface = []
+    for g in range(G):
+        targets_BQ = surface.y_query[g].repeat(E, 1).to(device)
+        per_surface.append(_compute_regression_loss(
+            logits_BQL=logits_BQL[g * E:(g + 1) * E],
+            targets_BQ=targets_BQ,
+            bardist_loss_fn=znorm_bardists[g],
+            ce_loss_weight=0.0,
+            crps_loss_weight=1.0,
+            mse_loss_weight=0.0,
+        ))
+    return torch.stack(per_surface)
+
 # Resolved from this file's location, not cwd, so checkpoints always land in
 # <repo_root>/checkpoints/<run_name> regardless of where finetune() is called from
 # (e.g. a notebook running with cwd=notebooks/).
