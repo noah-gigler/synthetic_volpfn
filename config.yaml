@@ -78,6 +78,28 @@ tau_median_real: 0.129
 tau_iqr_real: 0.219
 
 
+# mixture
+# --------------------------------------------------------------------------
+# fraction of generate_surfaces' output drawn from Heston instead of SSVI. 0.0 (default if
+# absent) = pure SSVI, matching every experiment run before this existed. Opt in per-run by
+# setting this > 0; every existing caller (noise.py's clean/noisy/eval-set builders) goes
+# through generate_surfaces with no extra args, so this is the only thing that needs changing.
+mixture:
+  heston_frac: 0.0
+
+
+# heston_prior (second synthetic surface family, mixed with SSVI - see heston.py)
+# --------------------------------------------------------------------------
+# v0/kappa/theta/rho are NOT sampled here - heston.sample_params reuses SSVI's own
+# v_bar/r/kappa/rho prior above directly (already historically-calibrated-to-SPX Heston-style
+# parameters; SSVI's `thetas` term structure IS the Heston mean-reverting-variance formula).
+# sigma (vol-of-vol) is the only parameter with no SSVI analogue - uniform, not lognormal like
+# the rest of the SSVI prior (kept simple; this range already brackets realistic equity-index
+# vol-of-vol).
+heston_prior:
+  sigma: {min: 0.1, max: 1.0}
+
+
 # grid settings
 # --------------------------------------------------------------------------
 # z = k/√τ

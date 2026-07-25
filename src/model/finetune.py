@@ -52,6 +52,7 @@ def crps_only_loss(estimator, surface, logits_BQL):
         ))
     return torch.stack(per_surface)
 
+
 # Resolved from this file's location, not cwd, so checkpoints always land in
 # <repo_root>/checkpoints/<run_name> regardless of where finetune() is called from
 # (e.g. a notebook running with cwd=notebooks/).
@@ -114,14 +115,28 @@ def _run_pass(estimator, surfaces, perf_opts, device, *, optimizer=None, schedul
                 per_surface = []
                 for g in range(B):
                     targets_BQ = surface.y_query[g].repeat(E, 1).to(device)
-                    per_surface.append(_compute_regression_loss(
-                        logits_BQL=logits_BQL[g * E:(g + 1) * E],
-                        targets_BQ=targets_BQ,
-                        bardist_loss_fn=znorm_bardists[g],
-                        ce_loss_weight=0.0,
-                        crps_loss_weight=1.0,
-                        mse_loss_weight=1.0,
-                    ))
+                    bardist = znorm_bardists[g]
+                    logits_g = logits_BQL[g * E:(g + 1) * E]
+
+                    crps = _compute_regression_loss(
+                        logits_BQL=logits_g, targets_BQ=targets_BQ, bardist_loss_fn=bardist,
+                        ce_loss_weight=0.0, crps_loss_weight=1.0, mse_loss_weight=0.0,
+                    )
+
+                    # MSE computed by hand rather than via _compute_regression_loss's own
+                    # mse_loss_weight=1.0 branch: that branch computes
+                    # diffs = predictions - targets using the raw target *before* masking, so
+                    # torch.where's unselected zero-branch still backprops 0*NaN=NaN, poisoning
+                    # the whole batch's gradient the moment any target is NaN (confirmed
+                    # empirically). Dummy-filling before the subtraction (mirroring the CRPS
+                    # branch's own already-safe pattern) fixes it with no effect when there's no
+                    # NaN to begin with - identical result on every existing SSVI-only run.
+                    valid_mask_BQ = ~torch.isnan(targets_BQ)
+                    targets_safe_BQ = torch.nan_to_num(targets_BQ, nan=0.0)
+                    diffs_BQ = bardist.mean(logits_g) - targets_safe_BQ
+                    mse = torch.where(valid_mask_BQ, diffs_BQ.square(), torch.zeros_like(diffs_BQ)).mean()
+
+                    per_surface.append(crps + mse)
                 loss_vec = torch.stack(per_surface)
 
             n_left -= B

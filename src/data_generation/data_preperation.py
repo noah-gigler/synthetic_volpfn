@@ -1,5 +1,6 @@
 import numpy as np
 from src.data_generation.SSVI import ssvi, sample_params
+from src.data_generation.heston import heston, sample_params as heston_sample_params
 from src.data_generation.grid import Grid
 
 # gaussian z sampling with mean ATM (z=0)
@@ -42,11 +43,37 @@ def sample_context_sizes(n_context, n, dist="uniform", group=1):
     return np.repeat(sizes, group)[:n]
 
 
-def generate_surfaces(cfg, n):
+def generate_surfaces(cfg, n, heston_frac=None):
+    # heston_frac: fraction of surfaces drawn from Heston instead of SSVI - mixing families
+    # encourages a genuine prior over arbitrage-free shapes rather than overfitting to one
+    # parametric form (see VolSmoothing_with_TabPFN_proposal.pdf). Defaults to cfg's
+    # mixture.heston_frac if set, else 0.0 (pure SSVI, unchanged from before this existed) -
+    # every existing caller (noise.py's clean/noisy/eval-set builders) goes through this
+    # function with no extra args, so the default must not silently change their behavior.
     g = Grid(cfg)
-    rho, eta, gamma, v_bar, v0, kappa = sample_params(cfg, n)
-    surfaces = ssvi(g.ttms, g.k.reshape(g.shape), rho, eta, gamma, v_bar, v0, kappa)
-    return g, surfaces
+    if heston_frac is None:
+        heston_frac = cfg.get("mixture", {}).get("heston_frac", 0.0)
+    n_heston = int(round(n * heston_frac))
+    n_ssvi = n - n_heston
+
+    surfaces = np.empty((n,) + g.shape)
+    if n_ssvi:
+        rho, eta, gamma, v_bar, v0, kappa = sample_params(cfg, n_ssvi)
+        surfaces[:n_ssvi] = ssvi(g.ttms, g.k.reshape(g.shape), rho, eta, gamma, v_bar, v0, kappa)
+    if n_heston:
+        v0h, kappah, thetah, sigmah, rhoh = heston_sample_params(cfg, n_heston)
+        # a small fraction of grid points (typically <1%, deep-OTM/shortest-maturity corner)
+        # come back NaN - a genuine float64 price-underflow floor, not a bug (report_notes.md).
+        # Left as NaN, not imputed: TabPFN's own finetuning loss (_compute_regression_loss's
+        # CRPS/MSE terms, this project's default) already masks NaN targets to exactly zero
+        # loss contribution rather than propagating them - confirmed by reading its source.
+        # Filling with a fake value (e.g. the surface's own mean IV) would be actively wrong:
+        # it injects a flat, physically incorrect value into exactly the most extreme corner of
+        # the surface, corrupting the training signal there instead of correctly excluding it.
+        surfaces[n_ssvi:] = heston(g.ttms, g.k.reshape(g.shape), v0h, kappah, thetah, sigmah, rhoh)
+
+    order = np.random.permutation(n)  # SSVI/Heston blocks shuffled together, not left contiguous
+    return g, surfaces[order]
 
 
 def _split_context_query(g, surfaces, k_idx, t_idx):
