@@ -28,13 +28,13 @@ VAL_CTX_SIZES = [5, 10, 20, 40, 60]
 EVAL_CTX_SIZES = [3, 5, 10, 20, 40, 60]
 
 
-def load_real_val(pool, cfg, rebuild=False):
-    path = VAL_DIR / "real.pkl"
+def load_real_val(pool, cfg, rebuild=False, selffit=False):
+    path = VAL_DIR / ("real_selffit.pkl" if selffit else "real.pkl")
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
     VAL_DIR.mkdir(parents=True, exist_ok=True)
     np.random.seed(VAL_SEED)
-    val = make_real_eval_set(pool, VAL_CTX_SIZES, cfg=cfg, n_heldout=N_HELDOUT)
+    val = make_real_eval_set(pool, VAL_CTX_SIZES, cfg=cfg, n_heldout=N_HELDOUT, selffit=selffit)
     pickle.dump(val, open(path, "wb"))
     return val
 
@@ -118,7 +118,8 @@ def _write_eval_txt(path, run_name, which, pool_name, results, arb_results, base
     open(path, "w").write("\n".join(lines) + "\n")
 
 
-def run_eval(run_name, pool, pool_name, cfg, device, which="final", rebuild_eval=False, baseline_jobs=None):
+def run_eval(run_name, pool, pool_name, cfg, device, which="final", rebuild_eval=False, baseline_jobs=None,
+             y_mean=0.300, y_scale=0.135, feature_scale=None):
     eval_set = load_real_eval(pool, pool_name, rebuild=rebuild_eval)
     arb_rows = load_arb_grid(cfg)
     model, state = load_finetuned(run_name, device, which=which)
@@ -126,9 +127,11 @@ def run_eval(run_name, pool, pool_name, cfg, device, which="final", rebuild_eval
     results, arb_results = {}, {}
     for i, (n_ctx, (tr, te)) in enumerate(eval_set.items(), 1):
         print(f"[{i}/{len(eval_set)}] n_ctx={n_ctx} ...", flush=True)
-        results[n_ctx] = eval_real_surfaces(model, tr, te, reload_state=state)
+        results[n_ctx] = eval_real_surfaces(model, tr, te, reload_state=state, iv_max=cfg["iv_max"],
+                                             y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
         cell_frac, mean_depth, worst_cell, arb_free = eval_arbitrage_fine(
-            model, tr, cfg, arb_rows, reload_state=state)
+            model, tr, cfg, arb_rows, reload_state=state, iv_max=cfg["iv_max"],
+            y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
         arb_results[n_ctx] = dict(cell_frac=float(cell_frac), mean_depth=float(mean_depth),
                                   worst_cell=float(worst_cell), arb_free=float(arb_free))
 
@@ -172,9 +175,34 @@ def main():
     p.add_argument("--baseline-jobs", type=int, default=None)
     p.add_argument("--wandb-project", default="volpfn", help="W&B project name (empty string to disable)")
     p.add_argument("--wandb-entity", default="volpfn")
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--selffit", action="store_true",
+                    help="OpDS-style: no held-out split, train/val on exact-match self-consistency "
+                         "at context points instead of held-out generalization (eval is unaffected, "
+                         "still genuine held-out)")
+    p.add_argument("--y-source", default="synthetic", choices=["synthetic", "real"],
+                    help="which cfg y_mean/y_scale (and z_mean/tau_mean if --feature-zscore) to use "
+                         "for the global z-score - real SPXW quotes are narrower-scaled than the "
+                         "synthetic prior (see config.yaml)")
+    p.add_argument("--feature-zscore", action="store_true",
+                    help="also z-score z/tau input features globally, using the same --y-source")
+    p.add_argument("--global-squashing", action="store_true",
+                    help="robust median/IQR global rescale for y AND z/tau (same --y-source) "
+                         "instead of mean/std - no clip (z/tau are already domain-bounded)")
     args = p.parse_args()
 
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
+    suffix = "_real" if args.y_source == "real" else ""
+    feature_scale = None
+    if args.global_squashing:
+        y_mean, y_scale = cfg["y_median" + suffix], cfg["y_iqr" + suffix]
+        feature_scale = (cfg["z_median" + suffix], cfg["z_iqr" + suffix],
+                          cfg["tau_median" + suffix], cfg["tau_iqr" + suffix])
+    else:
+        y_mean, y_scale = cfg["y_mean" + suffix], cfg["y_scale" + suffix]
+        if args.feature_zscore:
+            feature_scale = (cfg["z_mean" + suffix], cfg["z_scale" + suffix],
+                              cfg["tau_mean" + suffix], cfg["tau_scale" + suffix])
     train_pool, val_pool, test_pool = temporal_split(
         args.start, args.end, val_months=args.val_months, test_months=args.test_months, cfg=cfg)
     print(f"pool sizes: train={len(train_pool)} val={len(val_pool)} test={len(test_pool)}")
@@ -184,9 +212,9 @@ def main():
         init_state = torch.load(ROOT / "checkpoints" / args.init_from / "final.pt", map_location="cpu")
 
     if not args.eval_only:
-        val_data = load_real_val(val_pool, cfg, rebuild=args.rebuild_val)
+        val_data = load_real_val(val_pool, cfg, rebuild=args.rebuild_val, selffit=args.selffit)
         data_provider = partial(build_task, train_pool, n_context=tuple(args.n_context),
-                                cfg=cfg, n_heldout=N_HELDOUT, size_group=args.group_size)
+                                cfg=cfg, n_heldout=N_HELDOUT, size_group=args.group_size, selffit=args.selffit)
         loss_fn = partial(quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0,
                           lambda_reg_z=0.01, lambda_reg_r=0.01, return_parts=True)
         finetune(
@@ -194,8 +222,9 @@ def main():
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size,
             group_size=args.group_size, val_group_size=args.group_size,
             val_data=val_data, val_every=args.val_every, loss_fn=loss_fn, device=args.device,
+            iv_max=cfg["iv_max"], y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale,
             wandb_project=args.wandb_project or None, wandb_entity=args.wandb_entity,
-            init_state=init_state,
+            init_state=init_state, lr=args.lr,
         )
         eval_run_name = args.run_name
     else:
@@ -203,7 +232,8 @@ def main():
 
     pool = val_pool if args.pool == "val" else test_pool
     run_eval(eval_run_name, pool, args.pool, cfg, args.device,
-             which=args.which, rebuild_eval=args.rebuild_eval, baseline_jobs=args.baseline_jobs)
+             which=args.which, rebuild_eval=args.rebuild_eval, baseline_jobs=args.baseline_jobs,
+             y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
 
 
 if __name__ == "__main__":

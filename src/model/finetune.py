@@ -131,6 +131,9 @@ def finetune(
     val_data: tuple[list, list] | None = None,
     val_every: int = 1,
     iv_max: float = 1.5,
+    y_mean: float = 0.300,
+    y_scale: float = 0.135,
+    feature_scale=None,
     loss_fn=None,
     lr: float = 1e-5,
     weight_decay: float = 0.01,
@@ -243,7 +246,8 @@ def finetune(
     val_surfaces = None
     if val_train is not None:
         val_surfaces = preprocess_surfaces(
-            estimator, val_train, val_test, rng, iv_max, group_size=val_group_size or group_size)
+            estimator, val_train, val_test, rng, iv_max, group_size=val_group_size or group_size,
+            y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
         val_sizes = [len(y_ctx) for _, y_ctx in val_train]
 
     log.info(
@@ -254,7 +258,8 @@ def finetune(
     for epoch in range(n_epochs):
         train, test = data_provider(n_surfaces_per_epoch)
 
-        surfaces = preprocess_surfaces(estimator, train, test, rng, iv_max, group_size=group_size)
+        surfaces = preprocess_surfaces(estimator, train, test, rng, iv_max, group_size=group_size,
+                                        y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
         rng.shuffle(surfaces)  # shuffles groups; surfaces within a group stay together
         train_losses, train_parts = _run_pass(
             estimator, surfaces, perf_opts, device,

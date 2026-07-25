@@ -91,7 +91,7 @@ def check_arbitrage_flat(cfg, iv_flat, tol=-1e-10):
 
 
 def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_size=128, model_version=None,
-                   iv_max=1.5):
+                   iv_max=1.5, y_mean=0.300, y_scale=0.135, feature_scale=None):
     # `model` is ignored except as an API anchor; a shared batched estimator does the work.
     # reload_state=None evaluates the non-finetuned pretrained weights.
     est, pretrained_state = _get_eval_estimator(model_version)
@@ -100,7 +100,8 @@ def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_si
     rng = np.random.default_rng(0)
     # cap the forward batch so peak GPU memory stays bounded regardless of len(train_list);
     # ~16 same-shape surfaces peaks ~5 GiB, well under a 14.5 GiB card (scripts/probe_eval_batch.py)
-    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size)
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size,
+                                     y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
 
     maes, mapes, cal_violations, butterfly_violations = [], [], [], []
     for y_pred, y_te in _predict_raw(est, surfaces):
@@ -152,7 +153,8 @@ def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, gro
     query[:, 2] = 0.0
     test_list = [(query, np.zeros(len(query)))] * len(train_list)  # y unused, pred-only query
     rng = np.random.default_rng(0)
-    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size)
+    surfaces = preprocess_surfaces(est, train_list, test_list, rng, iv_max, group_size=group_size,
+                                     y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
 
     n_zb, n_rc, n_zc = arb_grid_shape(cfg)
     n_cal = (n_rc - 1) * n_zc
@@ -194,7 +196,7 @@ def eval_arbitrage_fine(model, train_list, cfg, arb_rows, reload_state=None, gro
 
 
 def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_size=64, model_version=None,
-                        iv_max=1.5):
+                        iv_max=1.5, y_mean=0.300, y_scale=0.135, feature_scale=None):
     """Truth-free scoring for real quotes: MAE vs mid and inside-[bid,ask] fraction, at the
     held-out quote locations and at the context quotes. Expects `make_real_eval_set(..., cfg=None)`
     pairs: context X = [z, tau, side] (bids then asks), test = (held_rows, y_held (n, 2) [bid, ask])."""
@@ -213,7 +215,8 @@ def eval_real_surfaces(model, train_list, test_list, reload_state=None, group_si
         targets.append((nc, bid, ask))
 
     rng = np.random.default_rng(0)
-    surfaces = preprocess_surfaces(est, train_list, queries, rng, iv_max, group_size=group_size)
+    surfaces = preprocess_surfaces(est, train_list, queries, rng, iv_max, group_size=group_size,
+                                     y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
 
     out = {k: [] for k in ("mae_held", "inside_held", "mae_ctx", "inside_ctx")}
     for (pred, _), (nc, bid, ask) in zip(_predict_raw(est, surfaces), targets):
