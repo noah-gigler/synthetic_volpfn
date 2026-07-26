@@ -114,8 +114,12 @@ def eval_surfaces(model, train_list, test_list, cfg, reload_state=None, group_si
 
     maes, mapes, cal_violations, butterfly_violations = [], [], [], []
     for y_pred, y_te in _predict_raw(est, surfaces):
-        maes.append(np.mean(np.abs(y_te - y_pred)))
-        mapes.append(np.mean(np.abs((y_te - y_pred) / y_te)) * 100)
+        # Heston surfaces are NaN in the deep-OTM/shortest-maturity corner (float64 price
+        # underflow, see data_preperation.generate_surfaces) - score only where truth exists.
+        # No-op on SSVI surfaces, which are finite everywhere.
+        m = np.isfinite(y_te)
+        maes.append(np.mean(np.abs(y_te[m] - y_pred[m])))
+        mapes.append(np.mean(np.abs((y_te[m] - y_pred[m]) / y_te[m])) * 100)
         cal_v, butterfly_v = check_arbitrage_flat(cfg, y_pred)
         cal_violations.append(cal_v)
         butterfly_violations.append(butterfly_v)
@@ -166,6 +170,12 @@ def eval_uncertainty(model, train_list, test_list, reload_state=None, group_size
     widths_all = []
     for bardist, logits_EQL, y_query_raw in _forward_logits(est, surfaces):
         y = y_query_raw.to(logits_EQL.device)  # (Q,)
+        # bardist.cdf asserts on NaN, so NaN truth (Heston's underflow corner) is filled with a
+        # dummy and dropped from every aggregate below - same fill-then-mask order quote_loss
+        # uses. All UQ metrics then share one support; no-op on NaN-free SSVI surfaces.
+        finite = torch.isfinite(y)
+        y = torch.nan_to_num(y, nan=0.0)
+        fin_np = finite.cpu().numpy()
 
         def icdf_ens(level):
             # average the per-estimator quantile prediction across the ensemble (E=1 in
@@ -182,16 +192,16 @@ def eval_uncertainty(model, train_list, test_list, reload_state=None, group_size
         pit = torch.stack(
             [bardist.cdf(logits_EQL[e], y.unsqueeze(-1)).squeeze(-1) for e in range(logits_EQL.shape[0])], 0,
         ).mean(0)
-        pit_all.append(pit.cpu().numpy())
+        pit_all.append(pit.cpu().numpy()[fin_np])
 
         lo, hi = icdf_ens(lo_level), icdf_ens(hi_level)
-        widths_all.append((hi - lo).cpu().numpy())
+        widths_all.append((hi - lo).cpu().numpy()[fin_np])
 
         for lv in pinball_levels:
-            pinball_all[lv].append(pinball(lv, icdf_ens(lv)).cpu().numpy())
+            pinball_all[lv].append(pinball(lv, icdf_ens(lv)).cpu().numpy()[fin_np])
 
         crps_terms = torch.stack([pinball(tau, icdf_ens(tau)) for tau in tau_grid], 0)  # (n_crps_quantiles, Q)
-        crps_all.append((2 * crps_terms.mean(0)).cpu().numpy())
+        crps_all.append((2 * crps_terms.mean(0)).cpu().numpy()[fin_np])
 
     return dict(
         crps=float(np.mean(np.concatenate(crps_all))),
