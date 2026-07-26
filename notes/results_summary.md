@@ -1,4 +1,4 @@
-# Results summary (as of 2026-07-17)
+# Results summary (as of 2026-07-26)
 
 Everything before the `z`-reparametrization + widened grid (`config.yaml`: `z∈[-1.5,0.5]`,
 `ttm_min=0.02`, commit `1c4c12e7` onward) is archived in git history, not repeated here — those
@@ -241,7 +241,104 @@ investigation unfolded, not as current numbers.** The new findings in this secti
     supervised ones never saw such points at all. An ablation (supervised loss + off-grid query
     exposure, no arb penalty) would be needed to isolate the two effects. Not yet run.
 
+## Session 3 (2026-07-26) — Heston refit baseline, and the first cross-family evaluation
+
+22. **The "SSVI refit beats the Heston refit on Heston data" result was a bug, not a finding.**
+    The original Heston refit used QuantLib's built-in `HestonModel.calibrate`; it worked on clean
+    quotes and fell apart on noisy ones, producing the alarming inversion. A hand-built fitter
+    (`src/model/heston.py`, mirroring `src/model/SSVI.py`'s structure) beats the SSVI refit at
+    *every* noise level and context size. Three things the built-in setup got wrong, all fixed:
+    (a) fit in **total-variance** space (`w = iv²·τ`) with the same `1/(2·y·τ·s)` quote-noise
+    weights the SSVI refit already used, not raw prices; (b) fit in **unconstrained coordinates**
+    (log for the four positive params, logit for `-ρ`) rather than a box — unscaled, `kappa~2` and
+    `v0~0.04` differ by ~50x and `trf`'s finite-difference Jacobian degrades; (c) price the
+    **same contract the generator did**, via the shared `iv_at` in `data_generation/heston.py`
+    (including its day-rounded τ) — the previous short-end mismatch was its own error source.
+23. **Heston refit is an exact oracle on clean Heston quotes**, the direct analogue of SSVI's
+    ≥6-point exact recovery on SSVI data: MAE **0.0000%** from `n_ctx≥10` at regime 0 over 512
+    surfaces/slot. This is the correctness check that makes the noisy numbers trustworthy.
+24. **The noisy Heston fit is genuinely ill-posed, not optimizer failure.** Diagnostic
+    (`heston_data_cost`, data term only, so fitted and true parameter vectors are comparable): at
+    *every* noisy setting, **100%** of fits reached an objective *below* the true-parameter
+    objective, median ratio 0.84–0.87. Noise moves the minimum away from truth; the optimizer finds
+    it correctly. This is the "narrow valley with a flat bottom" of Cui, del Baño Rollin & Germano
+    (arXiv 1511.08718) showing up directly in our own numbers. Quantified: at regime 1 / n=10,
+    `kappa` is off by **57%** (regime 4 / n=10: 72%) while surface MAE is only 0.61% — the
+    degeneracy is in parameter space and barely touches the surface.
+25. **Prior (Tikhonov/MAP) regularization helps exactly where theory says it should.** Penalizing
+    toward `config.yaml`'s generating prior makes the fit a MAP estimate under the true prior. It
+    is a large win at small context (regime 1, n=3: **1.79% vs 2.78%**) and neutral-to-marginally-
+    worse at n≥40 — the textbook bias-variance crossover. Note `lambda_prior` is only in MAP units
+    when `weights` are passed; against unweighted residuals (~1e-3 total-variance units) the
+    standardized prior rows (~1) outweigh the data by ~10⁶ and the fit never leaves the prior
+    median. Default is therefore `lambda_prior=0.0` — callers opt in.
+26. **Anchoring `v0` is a negative result.** Fixing `v0` at the shortest-maturity ATM total variance
+    (the standard literature recommendation for breaking the `v0`↔`kappa` degeneracy) is
+    *consistently worse* than leaving it free. Empirically `v0` is the **best**-identified of the
+    five parameters here (0.4–4% error), so anchoring spends a degree of freedom to pin down the
+    one thing the data already determines. `anchor_v0=True` is still the signature default but no
+    caller uses it.
+27. **First cross-family eval: `ssvi_supervised_gs4_15k_heston_full` on a pure-Heston eval set**
+    (`scripts/run_heston_eval.py`, `mixture.heston_frac=1.0`, 512 surfaces/slot, regime × n_ctx
+    breakdown, both refits as baselines). MAE in %, regime 1:
+
+    | n_ctx | FT | Heston | HestonMAP | SSVI |
+    |---|---|---|---|---|
+    | 3 | **1.34** | 2.78 | 1.79 | 4.57 |
+    | 5 | **0.79** | 1.76 | 0.82 | 4.01 |
+    | 10 | 0.44 | 0.59 | **0.42** | 0.98 |
+    | 20 | 0.27 | 0.32 | **0.26** | 0.63 |
+    | 40 | **0.16** | 0.19 | 0.17 | 0.52 |
+    | 60 | **0.14** | 0.16 | **0.14** | 0.49 |
+
+    Three things fall out of it:
+    - **SSVI has a hard misspecification floor at ~0.5%.** It plateaus at 0.49–0.58% and never
+      improves — not with more context (n=3→60 barely moves it past n=10), not with less noise
+      (regime 2→0 changes it by 0.007%). Both Heston refit and the finetuned model keep improving;
+      SSVI cannot. This is the cleanest structural result in the table and the empirical content of
+      the proposal's "prior generalizes across families" claim.
+    - **The finetuned model wins where the inverse problem is under-determined.** At n=3–5 under
+      noise it beats the plain Heston refit by ~2.2x and beats even the MAP version. Five free
+      Heston parameters against 3–5 quotes is under-determined per-surface; the amortized model is
+      not. This is the empirical version of the amortization argument.
+    - **At large context it ties the correctly-specified oracle** (n=60, regime 1: FT 0.14%,
+      HestonMAP 0.14%, Heston 0.16%) while staying ~3.5x better than the misspecified one.
+
+    Caveat worth carrying into the report: the finetuned model is *not* at its best on the clean
+    set (regime 0, n=60: 0.19% vs 0.14–0.16% at noisy regimes). `regime=0` sets `bid=ask=true`,
+    which is a different input distribution from anything it trained on (regimes are
+    lognormal-sampled), so regime 0 is mildly out-of-distribution for it. Don't read regime 0 as
+    "the easiest case" for the FT column.
+28. **Arbitrage/UQ on the same run.** 80–95% of surfaces arb-free (worst at n=3), violated-cell
+    fraction 0.00–0.06%. CRPS 0.0018–0.0103, 90% interval width 0.021–0.050, both tightening
+    monotonically with context. This is a *supervised* checkpoint with no arb penalty in the loss,
+    so the violation rate is expected and is **not** comparable to the quote/arb-loss runs.
+29. **Rejected alternatives to QuantLib for Heston pricing** (benchmarked, scratchpad only).
+    `pyfeng`: undeclared `statsmodels` dependency, FFT slower than QuantLib, 2.5e-2 relative price
+    error at the shortest maturity. `stochvolmodels`: 42x slower with 2.2% median IV disagreement,
+    traced to `vol_scaler = min(0.3, sqrt(v0*ttms[0]))` being sized off `ttms[0]` alone and tuned
+    for ~100% crypto vol. `py_vollib_vectorized`: broken on modern numba, unmaintained since 2021.
+    QuantLib at integration order 64 is exact to machine precision here. The real speed levers are
+    `ProcessPoolExecutor` (4.4x on 8 cores, bit-identical) and QuantLib object reuse (1.33x), both
+    now used.
+
 ## Bugs found and fixed this session
+
+- **`eval_uncertainty` crashed on Heston data, `eval_surfaces` silently returned NaN.** Heston
+  surfaces carry NaN in the deep-OTM/shortest-maturity corner (~0.2% of cells, float64 price
+  underflow); SSVI surfaces have none, so neither path had ever been exercised. `eval_uncertainty`
+  hit `bardist.cdf`'s NaN assert outright; `eval_surfaces` would have propagated NaN into the mean
+  and reported a NaN MAE. Both fixed in `surface_eval.py` (fill-then-mask, the same order
+  `quote_loss.py` uses). Note the first smoke run passed only because 8 surfaces didn't hit the
+  corner — it took the 512-surface run to surface it.
+- **Unpriceable-proposal residual scored as zero** (caught before it mattered). `_model_resid`'s
+  first draft used `np.nan_to_num(r, nan=0.0)`, which would have scored a parameter vector that
+  QuantLib cannot price *anywhere* as zero cost — a perfect fit, and a latent trap that would have
+  quietly corrupted every noisy Heston result. Now charges the full observed variance instead.
+- **`RuntimeError: stdDev (nan) must be non-negative`** from QuantLib `NPV()` when `trf` proposes a
+  divergent parameter region. That's a verdict on the proposal, not an error — wrapped in
+  try/except returning NaN at both the engine-construction and per-point levels.
+- **Prior penalty ~10⁶ too strong** — see finding 25.
 
 - **`preprocessed_dataset.py` `_stackable`**: only checked `X_context` shape equality before
   batching consecutive surfaces together, never `X_query`. Since `quote_data_preparation` draws a
@@ -296,3 +393,14 @@ investigation unfolded, not as current numbers.** The new findings in this secti
   outlier persists after retraining.
 - Real-data calibration (SPXW quotes) not revisited this session — last state predates the grid
   reparametrization; needs re-validation before reuse.
+- Evaluate `ssvi_supervised_gs4_72k_heston_full` and the two `mix50` checkpoints on the same frozen
+  Heston eval set (`datasets/eval/heston.pkl` + `heston_baselines.json` are cached on Euler, so each
+  is a GPU pass only, refit columns free). Two of these runs were still training at time of writing.
+- Complete the 2x2: SSVI refit vs Heston refit on *SSVI* data. Finding 27 only has the
+  Heston-data row; the mirror row is what turns "SSVI is misspecified on Heston data" into a
+  symmetric statement about family mismatch rather than a claim about SSVI specifically.
+- Wire `fit_heston` into `run_finetuning.py`'s `_baselines` so mixture-trained runs get both refit
+  columns by default, instead of only via the standalone `scripts/run_heston_eval.py`.
+- Consider adding Bates and SABR families — Bates is nearly free given the QuantLib Heston setup
+  (`BatesProcess`/`BatesModel`/`BatesEngine`), and a third family would let the misspecification
+  floor in finding 27 be shown as a general effect rather than a single SSVI-vs-Heston pair.
