@@ -46,6 +46,21 @@ def _call_price_one(engine, settlement, k, tau):
     return option.NPV()
 
 
+def iv_at(engine, settlement, k, tau):
+    days = max(1, int(round(tau * 365)))
+    tau_actual = days / 365.0
+    call_price = _call_price_one(engine, settlement, k, tau)
+    is_call_otm = k > 0
+    target = call_price if is_call_otm else call_price - 1.0 + np.exp(k)
+    cp = "c" if is_call_otm else "p"
+    if target > 0:
+        try:
+            return black_iv(target, 1.0, np.exp(k), 0.0, tau_actual, cp)
+        except Exception:  # negative-noise below intrinsic / above max / no convergence
+            pass
+    return np.nan
+
+
 def sample_params(cfg, n, max_tries=50):
     # v_bar/r/kappa/rho in config.yaml's ssvi_prior are already historically-calibrated-to-SPX
     # Heston-style parameters, not SSVI-specific: SSVI.py's own `thetas` term-structure formula
@@ -99,40 +114,7 @@ def heston(ttms, ks, v0, kappa, theta, sigma, rho):
         engine = _heston_engine(float(v0[i]), float(kappa[i]), float(theta[i]),
                                  float(sigma[i]), float(rho[i]), settlement)
         for tau_ij, k_ij in zip(tau[i].ravel(), k[i].ravel()):
-            # day-granular exercise date: tau actually priced (tau_actual) can differ from the
-            # nominal grid tau by up to ~0.5/365 - negligible except at the shortest maturities
-            # (tau_min=0.02, ~7 days), where it's a real but small distortion; using tau_actual
-            # consistently for both the price and its own IV inversion keeps the two internally
-            # consistent even though it's not exactly the nominal grid point.
-            days = max(1, int(round(tau_ij * 365)))
-            tau_actual = days / 365.0
-            call_price = _call_price_one(engine, settlement, k_ij, tau_ij)
-
-            # IV inversion: vollib's black_iv (Jaeckel's "Let's Be Rational", already a project
-            # dependency - see src/real_data/quotes.py, the exact same pattern) via OTM-only
-            # pricing (put for k<=0, call for k>0, put-call parity) - deep-ITM call/put prices
-            # are dominated by intrinsic value, leaving a numerically tiny time-value component
-            # that makes naive same-side inversion ill-conditioned; OTM price is ~pure time
-            # value, well-conditioned.
-            is_call_otm = k_ij > 0
-            target = call_price if is_call_otm else call_price - 1.0 + np.exp(k_ij)
-            cp = "c" if is_call_otm else "p"
-
-            # target<=0 carries no recoverable vol information: negative values are float64
-            # noise right at the machine-epsilon floor (~1e-16, confirmed empirically - not
-            # worth an arbitrary magnitude threshold, QuantLib itself is precise enough that
-            # essentially every genuinely-positive price, however tiny, inverts to a sane IV);
-            # target==0 exactly is a real, distinct pathology - it's technically AT (not below)
-            # intrinsic, so black_iv doesn't raise, it silently returns a meaningless IV=0.0 for
-            # a price that carries no information (deep-OTM, very-short-maturity options are
-            # genuinely almost worthless in double precision, real or synthetic). Masking both
-            # to NaN is the honest outcome; downstream code must already tolerate NaN (mirrors
-            # quotes.py's convention).
-            if target > 0:
-                try:
-                    iv_flat[pos] = black_iv(target, 1.0, np.exp(k_ij), 0.0, tau_actual, cp)
-                except Exception:  # negative-noise below intrinsic / above max / no convergence
-                    pass
+            iv_flat[pos] = iv_at(engine, settlement, k_ij, tau_ij)
             pos += 1
 
     return iv_flat.reshape(k.shape)
