@@ -5,7 +5,7 @@ from src.data_generation.grid import Grid
 
 # gaussian z sampling with mean ATM (z=0)
 # uniform ttm sampling as the tau grid is already denser at the short end (rho=sqrt(tau) uniform)
-def sample_sparse_points(zs, ttms, n_points, n_samples):
+def sample_sparse_points(zs, ttms, n_points, n_samples, valid_mask=None):
     z_weights = np.exp(-0.5 * (zs / 0.25) ** 2)           # ATM-weighted in z (z=0 is ATM)
     z_weights /= z_weights.sum()
 
@@ -15,9 +15,15 @@ def sample_sparse_points(zs, ttms, n_points, n_samples):
     scalar = np.isscalar(n_points)
     n_points = np.broadcast_to(np.asarray(n_points, dtype=int), (n_samples,))
 
+    def weights_for(i):
+        if valid_mask is None:
+            return flat_weights
+        w = flat_weights * valid_mask[i]
+        return w / w.sum()
+
     flat_idx = [
-        np.random.choice(len(zs) * len(ttms), size=m, replace=False, p=flat_weights)
-        for m in n_points
+        np.random.choice(len(zs) * len(ttms), size=m, replace=False, p=weights_for(i))
+        for i, m in enumerate(n_points)
     ]
 
     if scalar:
@@ -95,17 +101,20 @@ def _split_context_query(g, surfaces, k_idx, t_idx):
 
 def data_preparation(cfg, n, n_context, size_dist="uniform", size_group=1):
     g, surfaces = generate_surfaces(cfg, n)
+    valid_mask = ~np.isnan(surfaces).reshape(n, -1)  # NaN grid points must never be context
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
-    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes, n_samples=n)
+    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes, n_samples=n, valid_mask=valid_mask)
     return _split_context_query(g, surfaces, k_idx, t_idx)
 
 
 def make_stratified_eval_set(cfg, n_surfaces, context_sizes):
     g, surfaces = generate_surfaces(cfg, n_surfaces)
+    valid_mask = ~np.isnan(surfaces).reshape(n_surfaces, -1)
 
     train, test = [], []
     for size in context_sizes:
-        k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, np.full(n_surfaces, size), n_samples=n_surfaces)
+        k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, np.full(n_surfaces, size),
+                                            n_samples=n_surfaces, valid_mask=valid_mask)
         tr, te = _split_context_query(g, surfaces, k_idx, t_idx)
         train += tr
         test += te

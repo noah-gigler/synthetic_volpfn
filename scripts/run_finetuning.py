@@ -331,11 +331,17 @@ def main():
                          "whether the MSE term was diluting CRPS's pressure toward a calibrated "
                          "predictive distribution (see report_notes.md PIT investigation). Only "
                          "applies to the supervised experiment (arb already uses its own loss_fn).")
+    p.add_argument("--heston-frac", type=float, default=None,
+                    help="override cfg's mixture.heston_frac in-memory (0.0-1.0) - lets "
+                         "concurrent runs use different fractions without editing the shared, "
+                         "synced config.yaml on disk")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
     run_name = args.run_name or f"{args.experiment}_{args.n_context[0]}_{args.n_context[1]}"
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
+    if args.heston_frac is not None:
+        cfg.setdefault("mixture", {})["heston_frac"] = args.heston_frac
 
     rho = args.rho[0] if len(args.rho) == 1 else tuple(args.rho)
     y_mean, y_scale = cfg["y_mean"], cfg["y_scale"]

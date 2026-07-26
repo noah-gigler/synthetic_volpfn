@@ -92,8 +92,9 @@ def noisy_data_preparation(cfg, n, n_context, size_dist="uniform", regime=None, 
     # n_context counts quote locations (context holds 2*n_context rows)
     noise_cfg = cfg["noise"]
     g, surfaces = generate_surfaces(cfg, n)
+    valid_mask = ~np.isnan(surfaces).reshape(n, -1)  # NaN true IV -> NaN bid/ask, must never be context
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
-    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes, n_samples=n)
+    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes, n_samples=n, valid_mask=valid_mask)
     regimes = _sample_regimes(noise_cfg, n, regime)
     rhos = _sample_rhos(n, rho)
     return _noisy_split(g, surfaces, k_idx, t_idx, regimes, rhos, noise_cfg)
@@ -105,8 +106,9 @@ def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", re
     # [n_heldout quote rows (y=[bid,ask])]. True prices appear nowhere.
     noise_cfg = cfg["noise"]
     g, surfaces = generate_surfaces(cfg, n)
+    valid_mask = ~np.isnan(surfaces).reshape(n, -1)  # NaN true IV -> NaN bid/ask, must never be context
     sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
-    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes + n_heldout, n_samples=n)
+    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes + n_heldout, n_samples=n, valid_mask=valid_mask)
     regimes = _sample_regimes(noise_cfg, n, regime)
     rhos = _sample_rhos(n, rho)
 
@@ -149,12 +151,14 @@ def make_noisy_stratified_eval_set(cfg, n_surfaces, context_sizes, regime=None, 
     # same n_surfaces at every size in context_sizes, size-major; noise drawn once (frozen)
     noise_cfg = cfg["noise"]
     g, surfaces = generate_surfaces(cfg, n_surfaces)
+    valid_mask = ~np.isnan(surfaces).reshape(n_surfaces, -1)
     regimes = _sample_regimes(noise_cfg, n_surfaces, regime)
     rhos = _sample_rhos(n_surfaces, rho)
 
     train, test = [], []
     for size in context_sizes:
-        k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, np.full(n_surfaces, size), n_samples=n_surfaces)
+        k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, np.full(n_surfaces, size),
+                                            n_samples=n_surfaces, valid_mask=valid_mask)
         tr, te = _noisy_split(g, surfaces, k_idx, t_idx, regimes, rhos, noise_cfg)
         train += tr
         test += te
