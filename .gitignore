@@ -17,3 +17,5 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+report/
