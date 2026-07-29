@@ -42,6 +42,7 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
     r_lo, r_hi = tau_lo.sqrt().view(1, -1, 1), tau_hi.sqrt().view(1, -1, 1)
 
     losses, nlls, cals, bfs, reg_zs, reg_rs, mean_hinges = [], [], [], [], [], [], []
+    ins_fracs, bf_viol_fracs, cal_viol_fracs = [], [], []
     for g in range(G):
         logits = logits_BQL[g * E:(g + 1) * E]
         bardist = znorm_bardists[g]
@@ -90,6 +91,17 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
         g_fn = (1 - k * w_k / (2 * w)) ** 2 - w_k**2 / 4 * (1 / w + 0.25) + w_kk / 2
         bf = torch.relu(eps_bf - g_fn).mean()
 
+        # real-time diagnostics (zero weight, not added to the loss sum) - the periodic eval
+        # scripts (eval_arbitrage_fine, inside_spread_fraction) only run at the end of a job or
+        # on --eval-only; these track the same quantities every epoch, on the same rows already
+        # computed above for the hinges, so effectively free. NOT expected to numerically match
+        # the eval-time cell_frac exactly - that uses a bigger, finer, jittered grid; these use
+        # the smaller training-time arb grid, so read them as a correlated proxy, not the number
+        # that goes in a report table.
+        with torch.no_grad():
+            bf_viol_fracs.append((g_fn < 0).float().mean())
+            cal_viol_fracs.append((eps_cal + r_lo / r_hi - iv_hi / iv_lo.clamp_min(1e-3) > 0).float().mean())
+
         # curvature regularizers (à la OpDS Loss.reg_z/reg_r): raw-IV roughness on the
         # butterfly grid, independent of whether a hinge actually fires - the mechanism
         # that lets a dense-but-fixed z_b (and sparse r_b) stay safe between grid points
@@ -115,14 +127,27 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
         # (regime=0's bid=ask=true) on purpose: those equal the true price, so hinging against them
         # would silently reintroduce a truth-supervised MSE term through the back door.
         n_hi = mask & ~is_point
+        # y_query_raw is NaN on arb-grid rows (only held-out rows carry real bid/ask); relu(NaN
+        # - iv) is NaN regardless of downstream masking, and that NaN still backprops through
+        # the shared forward pass into every query position's logits, corrupting the whole model
+        # on the very first step even though the visible mean_hinge value looks finite (the NaN
+        # rows are excluded from it via indexing, but NOT from the gradient without this fix) -
+        # replace NaN with a safe finite dummy BEFORE the relu, same principle as `safe` above
+        y_raw = torch.nan_to_num(batch.y_query_raw[g].to(logits_BQL.device), nan=0.0)
+
+        with torch.no_grad():
+            # real-time analogue of eval_real_surfaces' ins% - fraction of held-out (non-point)
+            # rows where the predicted mean already lands inside [bid, ask]. Falls back to 0 (not
+            # NaN) when n_hi is empty, same convention as mean_hinge below - deliberately avoids
+            # reintroducing the empty-selection-mean NaN footgun into a logged/averaged metric.
+            # In practice n_hi is never empty now: training's provider never draws regime=0, and
+            # regime=0 was excluded from arb val's stratification for the same reason (see
+            # ARB_VAL_REGIMES in run_finetuning.py) - this is a defensive fallback, not a live path.
+            inside = (iv >= y_raw[:, 0]) & (iv <= y_raw[:, 1])
+            ins_fracs.append(inside[:, n_hi].float().mean() if n_hi.any()
+                              else torch.zeros((), device=logits_BQL.device))
+
         if lambda_mean_hinge and n_hi.any():
-            # y_query_raw is NaN on arb-grid rows (only held-out rows carry real bid/ask); relu(NaN
-            # - iv) is NaN regardless of downstream masking, and that NaN still backprops through
-            # the shared forward pass into every query position's logits, corrupting the whole model
-            # on the very first step even though the visible mean_hinge value looks finite (the NaN
-            # rows are excluded from it via indexing, but NOT from the gradient without this fix) -
-            # replace NaN with a safe finite dummy BEFORE the relu, same principle as `safe` above
-            y_raw = torch.nan_to_num(batch.y_query_raw[g].to(logits_BQL.device), nan=0.0)
             below = torch.relu(y_raw[:, 0] - iv)
             above = torch.relu(iv - y_raw[:, 1])
             mean_hinge = (below**2 + above**2)[:, n_hi].mean()
@@ -153,6 +178,7 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
     if return_parts:
         parts = {"nll": torch.stack(nlls), "cal": torch.stack(cals), "bf": torch.stack(bfs),
                  "reg_z": torch.stack(reg_zs), "reg_r": torch.stack(reg_rs),
-                 "mean_hinge": torch.stack(mean_hinges)}
+                 "mean_hinge": torch.stack(mean_hinges), "ins_frac": torch.stack(ins_fracs),
+                 "bf_viol_frac": torch.stack(bf_viol_fracs), "cal_viol_frac": torch.stack(cal_viol_fracs)}
         return total, parts
     return total
