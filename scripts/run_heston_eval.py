@@ -23,7 +23,7 @@ from src.model.SSVI import fit_ssvi, predict_ssvi
 from src.model.heston import fit_heston, predict_heston
 from src.evaluation.surface_eval import eval_arbitrage_fine, eval_surfaces, eval_uncertainty
 from scripts.run_finetuning import (
-    EVAL_DIR, EVAL_SEED, ROOT, load_arb_grid, load_finetuned, _split_quotes,
+    EVAL_DIR, EVAL_SEED, ROOT, load_arb_grid, load_eval, load_finetuned, _split_quotes,
 )
 
 REFITS = {
@@ -113,8 +113,8 @@ def load_heston_baselines(cfg, eval_set, rebuild=False, n_jobs=None, tag=""):
     return out
 
 
-def _write_txt(path, run_name, which, results, arb_results, uq_results, baselines):
-    lines = [f"{run_name} ({which}.pt) - PURE HESTON eval set, Heston + SSVI refit baselines"]
+def _write_txt(path, run_name, which, results, arb_results, uq_results, baselines, dataset):
+    lines = [f"{run_name} ({which}.pt) - {dataset} eval set, Heston + SSVI refit baselines"]
 
     # driven by `baselines`, not `results`, so --skip-model still prints the refit comparison
     for m in sorted(baselines):
@@ -162,13 +162,23 @@ def main():
     p.add_argument("--tag", default="", help="eval-set cache suffix; use for smoke runs so the "
                                              "full frozen set isn't overwritten")
     p.add_argument("--skip-model", action="store_true", help="baselines only (CPU, no GPU needed)")
+    p.add_argument("--ssvi-data", action="store_true",
+                   help="score both refits on the standard *SSVI* eval set instead of the Heston "
+                        "one - the mirror row that completes the family x refit 2x2")
     p.add_argument("--y-mean", type=float, default=0.300)
     p.add_argument("--y-scale", type=float, default=0.135)
     a = p.parse_args()
 
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
     regimes = [int(m) if float(m).is_integer() else m for m in a.regimes]
-    eval_set = load_heston_eval(cfg, regimes, a.ctx_sizes, a.eval_n, rebuild=a.rebuild, tag=a.tag)
+    if a.ssvi_data:
+        a.tag += "_ssvidata"  # keeps the Heston-set caches and outputs untouched
+        # load_eval returns the whole frozen dict, so honour --regimes/--ctx-sizes by subsetting
+        full = load_eval(cfg, legacy=True)
+        eval_set = {m: {n: full[m][n] for n in a.ctx_sizes if n in full[m]}
+                    for m in regimes if m in full}
+    else:
+        eval_set = load_heston_eval(cfg, regimes, a.ctx_sizes, a.eval_n, rebuild=a.rebuild, tag=a.tag)
 
     results, arb_results, uq_results, pit_arrays = {}, {}, {}, {}
     if not a.skip_model:
@@ -206,7 +216,8 @@ def main():
     if pit_arrays:
         np.savez(out_dir / f"pit_heston{a.tag}.npz", **pit_arrays)
     _write_txt(out_dir / f"eval_heston{a.tag}.txt", a.run_name, a.which,
-               results, arb_results, uq_results, baselines)
+               results, arb_results, uq_results, baselines,
+               "PURE SSVI" if a.ssvi_data else "PURE HESTON")
     print(open(out_dir / f"eval_heston{a.tag}.txt").read())
 
 
