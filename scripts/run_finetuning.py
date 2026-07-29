@@ -37,12 +37,12 @@ EVAL_CTX_SIZES = [3, 5, 10, 20, 40, 60]
 EVAL_REGIMES = [0, 0.5, 1, 2]
 
 
-def _split_by_regime(build, n_total):
-    # n_total surfaces split into equal chunks across EVAL_REGIMES, so val is stratified
+def _split_by_regime(build, n_total, regimes=EVAL_REGIMES):
+    # n_total surfaces split into equal chunks across `regimes`, so val is stratified
     # by noise regime instead of a single random draw
-    n = n_total // len(EVAL_REGIMES)
+    n = n_total // len(regimes)
     train, test = [], []
-    for m in EVAL_REGIMES:
+    for m in regimes:
         tr, te = build(n, m)
         train += tr
         test += te
@@ -54,12 +54,22 @@ def _supervised_val(cfg, rho=0.0):
         lambda n, m: make_noisy_stratified_eval_set(cfg, n, VAL_CTX_SIZES, regime=m, rho=rho), 128)
 
 
+# arb training never draws regime=0 (quote_data_preparation's provider is never called with
+# regime=0 - see EXPERIMENTS["arb"]["provider"]), so a val set stratified over all of EVAL_REGIMES
+# validates on a noise level the model never trains on. Worse: at regime=0 every held-out row is
+# is_point (bid=ask=true), so point_nll (bucket cross-entropy against the exact value) applies
+# throughout - a much larger-magnitude loss than interval_nll on wide noisy intervals - and ends up
+# dominating val_loss (~75% of the aggregate from ~25% of the surfaces, measured), making best.pt
+# selection mostly about a regime the model was never trained toward. Exclude it here.
+ARB_VAL_REGIMES = [m for m in EVAL_REGIMES if m != 0]
+
+
 def _arb_val(cfg, rho=0.0):
     def build(n, m):
         sets = [make_quote_eval_set(cfg, n, s, N_HELDOUT, regime=m, size_group=GROUP_SIZE, rho=rho)
                 for s in VAL_CTX_SIZES]
         return sum((s[0] for s in sets), []), sum((s[1] for s in sets), [])
-    return _split_by_regime(build, 128)
+    return _split_by_regime(build, 128, regimes=ARB_VAL_REGIMES)
 
 
 GROUP_SIZE = 8
