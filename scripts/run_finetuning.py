@@ -90,12 +90,19 @@ def _rho_tag(rho):
     return f"rho{rho}"
 
 
-def load_eval(cfg, rebuild=False, rho=0.0):
+def _legacy_tag(legacy):
+    # legacy (the default) must not share caches with --calibrated-noise (or overwrite them on
+    # --rebuild) - matches the pre-existing frozen "_oldnoise" files predating calibration
+    return "_oldnoise" if legacy else ""
+
+
+def load_eval(cfg, rebuild=False, rho=0.0, legacy=True):
     # frozen eval set, shared across every experiment (both train on the noisy/bid-ask
     # schema); surfaces are seeded per n_ctx only, so it's reused as-is across models.
     # rho=0 is the shared/default cache; any other rho gets its own file.
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    path = EVAL_DIR / ("noisy.pkl" if rho == 0.0 else f"noisy_{_rho_tag(rho)}.pkl")
+    stem = "noisy" if rho == 0.0 else f"noisy_{_rho_tag(rho)}"
+    path = EVAL_DIR / f"{stem}{_legacy_tag(legacy)}.pkl"
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
     eval_set = {}
@@ -121,11 +128,12 @@ def load_arb_grid(cfg, rebuild=False):
     return rows
 
 
-def load_val(experiment, cfg, rebuild=False, rho=0.0):
+def load_val(experiment, cfg, rebuild=False, rho=0.0, legacy=True):
     # rho=0 is the shared/frozen cache reused across every run of this experiment; any other
     # rho gets its own cache so it doesn't clobber that baseline
     VAL_DIR.mkdir(parents=True, exist_ok=True)
-    path = VAL_DIR / (f"{experiment}.pkl" if rho == 0.0 else f"{experiment}_{_rho_tag(rho)}.pkl")
+    stem = experiment if rho == 0.0 else f"{experiment}_{_rho_tag(rho)}"
+    path = VAL_DIR / f"{stem}{_legacy_tag(legacy)}.pkl"
     if path.exists() and not rebuild:
         return pickle.load(open(path, "rb"))
     np.random.seed(VAL_SEED)
@@ -201,10 +209,11 @@ def _baselines(eval_set, cfg, n_jobs=None):
     return out
 
 
-def load_baselines(cfg, eval_set, rebuild=False, n_jobs=None, rho=0.0):
+def load_baselines(cfg, eval_set, rebuild=False, n_jobs=None, rho=0.0, legacy=True):
     # baselines are context-dependent (SSVI refit sees the noisy quotes), so they're rho-aware
     # the same way load_eval is: rho=0 is the shared cache, anything else gets its own file
-    path = EVAL_DIR / ("noisy_baselines.json" if rho == 0.0 else f"noisy_baselines_{_rho_tag(rho)}.json")
+    stem = "noisy_baselines" if rho == 0.0 else f"noisy_baselines_{_rho_tag(rho)}"
+    path = EVAL_DIR / f"{stem}{_legacy_tag(legacy)}.json"
     if path.exists() and not rebuild:
         raw = json.load(open(path))
         return {float(m): {int(n): v for n, v in rows.items()} for m, rows in raw.items()}
@@ -244,10 +253,10 @@ def _write_eval_txt(path, run_name, which, rho, results, arb_results, uq_results
 
 
 def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, baseline_jobs=None,
-             model_version=None, y_mean=0.300, y_scale=0.135, feature_scale=None):
+             model_version=None, y_mean=0.300, y_scale=0.135, feature_scale=None, legacy=False):
     # matched-rho eval: a model trained on correlated quote noise (rho!=0) should be evaluated
     # against noise drawn the same way, not the default iid (rho=0) set - see notes/results_summary.md
-    eval_set = load_eval(cfg, rebuild=rebuild_eval, rho=rho)
+    eval_set = load_eval(cfg, rebuild=rebuild_eval, rho=rho, legacy=legacy)
     arb_rows = load_arb_grid(cfg, rebuild=rebuild_eval)
     model, state = load_finetuned(run_name, device, which=which, model_version=model_version)
     results, arb_results, uq_results, pit_arrays = {}, {}, {}, {}
@@ -274,7 +283,7 @@ def run_eval(run_name, cfg, device, rebuild_eval=False, which="final", rho=0.0, 
             crps=uq["crps"], pinball=uq["pinball"], mean_interval_width=uq["mean_interval_width"])
         pit_arrays[f"{m}_{n_ctx}"] = uq["pit"]
 
-    baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval, n_jobs=baseline_jobs, rho=rho)
+    baselines = load_baselines(cfg, eval_set, rebuild=rebuild_eval, n_jobs=baseline_jobs, rho=rho, legacy=legacy)
 
     out_dir = ROOT / "checkpoints" / run_name
     json.dump(dict(mae=results, arb=arb_results, uq=uq_results), open(out_dir / "eval.json", "w"), indent=2)
@@ -335,11 +344,21 @@ def main():
                     help="override cfg's mixture.heston_frac in-memory (0.0-1.0) - lets "
                          "concurrent runs use different fractions without editing the shared, "
                          "synced config.yaml on disk")
+    p.add_argument("--calibrated-noise", action="store_true",
+                    help="use config.yaml's calibrated (SPXW-fit) noise: block instead of the "
+                         "default noise_legacy: constants, and route eval/val/baseline caches to "
+                         "the calibrated files instead of the frozen '_oldnoise' ones. DEFAULT IS "
+                         "LEGACY NOISE for now - the calibration is still being validated (see "
+                         "notes/results_summary.md), so every run stays comparable to the existing "
+                         "results unless this is passed explicitly")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
     run_name = args.run_name or f"{args.experiment}_{args.n_context[0]}_{args.n_context[1]}"
     cfg = yaml.safe_load(open(ROOT / "config.yaml"))
+    legacy_noise = not args.calibrated_noise
+    if legacy_noise:
+        cfg["noise"] = cfg["noise_legacy"]
     if args.heston_frac is not None:
         cfg.setdefault("mixture", {})["heston_frac"] = args.heston_frac
 
@@ -353,7 +372,7 @@ def main():
         feature_scale = (cfg["z_mean"], cfg["z_scale"], cfg["tau_mean"], cfg["tau_scale"])
 
     if not args.eval_only:
-        val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=rho)
+        val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=rho, legacy=legacy_noise)
         data_provider = spec["provider"](cfg, tuple(args.n_context), rho)
         loss_fn = crps_only_loss if args.crps_only else spec["loss"](cfg)
         init_state = None
@@ -373,7 +392,7 @@ def main():
 
     run_eval(run_name, cfg, args.device, rebuild_eval=args.rebuild_eval, which=args.which,
              baseline_jobs=args.baseline_jobs, rho=rho, model_version=args.model_version,
-             y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
+             y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale, legacy=legacy_noise)
 
 
 if __name__ == "__main__":

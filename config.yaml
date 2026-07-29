@@ -25,11 +25,29 @@ gamma:
 # quote noise (bid/ask spread model, see src/data_generation/noise.py)
 # --------------------------------------------------------------------------
 noise:
-  beta: 0.015         # market maker half spread (1.5%)
-  tick: 3.0e-4        # minimum half spread ($0.05 tick on a $150 stock -> 3.0e-4)
-  cap: 0.05           # max IV half-spread (liquidity-filter proxy; stops wings from having infinite spread)
-  regime_sigma: 0.5   # per-surface lognormal scale on the spread 
-  jitter_sigma: 0.3   # pointwise indepentent scaling to prevent inversion
+  # calibrated to SPXW 2020-2023 (1001 days) - see notes/results_summary.md. The previous
+  # values made every synthetic quote ~7x looser than the market's, and drove half the grid
+  # into `cap`. Fitted on the ATM-Gaussian-weighted distribution the sampler actually draws
+  # from, not pooled over the grid: beta sets the ATM width (vega large -> price term rules),
+  # tick sets the wings (vega small -> tick term rules), so a pooled fit over-weights wings
+  # nobody samples and leaves ATM ~30% too wide.
+  beta: 0.005         # market maker half spread (0.5%)
+  tick: 2.0e-5        # minimum half spread ($0.05 tick on SPX ~4500; the old 3.0e-4 assumed a $150 underlying)
+  cap: 0.05           # max IV half-spread (liquidity-filter proxy; no longer binds on real data post-calibration)
+  regime_sigma: 0.5   # per-surface lognormal scale on the spread; regime=1 is the median SPXW day,
+                      # regime=2 the ~95th percentile. Kept wide (real log-sd is 0.36) for stress coverage
+  jitter_sigma: 0.4   # pointwise independent scaling; real SPXW noise is mostly PER-QUOTE
+                      # (between/within log-sd 0.28/0.43), not per-surface - cf. the rho ablation
+
+# pre-calibration constants, frozen for backward comparison against every run predating the
+# SPXW calibration above - select with `--legacy-noise` (see scripts/run_finetuning.py). Not
+# used by default; kept only so old and new results stay reproducible side by side.
+noise_legacy:
+  beta: 0.015
+  tick: 3.0e-4
+  cap: 0.05
+  regime_sigma: 0.5
+  jitter_sigma: 0.3
 
 
 # output bar distribution
