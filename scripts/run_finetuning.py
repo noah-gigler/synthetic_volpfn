@@ -176,8 +176,11 @@ def _baseline_one(args):
     X2_k = np.column_stack([z_to_k(X2[:, 0], X2[:, 1]), X2[:, 1]])
     params, _ = fit_ssvi(X2_k, mq, cfg_dict, weights=w)
     pred = predict_ssvi(params, g.ttms[:, None], g.k.reshape(g.shape)).ravel()
-    wls = np.mean(np.abs(pred - yq))
-    wls_mape = np.mean(np.abs((yq - pred) / yq)) * 100
+    # Heston surfaces carry NaN in the deep-OTM/short-tau corner (price underflow); averaging
+    # over them makes the whole baseline NaN. SSVI surfaces have none, so this is a no-op there.
+    m = np.isfinite(yq) & np.isfinite(pred)
+    wls = np.mean(np.abs(pred[m] - yq[m]))
+    wls_mape = np.mean(np.abs((yq[m] - pred[m]) / yq[m])) * 100
     idx = [np.where((Xq[:, 0] == X2[i, 0]) & (Xq[:, 1] == X2[i, 1]))[0][0] for i in range(len(mq))]
     mid = np.abs(mq - yq[idx]).mean()
     return wls, wls_mape, mid

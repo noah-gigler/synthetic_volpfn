@@ -105,10 +105,27 @@ def quote_data_preparation(cfg, n, n_context, n_heldout, size_dist="uniform", re
     # decoupled query: [random arb grid (y=NaN, fresh every size_group chunk)] ++
     # [n_heldout quote rows (y=[bid,ask])]. True prices appear nowhere.
     noise_cfg = cfg["noise"]
+    sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
     g, surfaces = generate_surfaces(cfg, n)
     valid_mask = ~np.isnan(surfaces).reshape(n, -1)  # NaN true IV -> NaN bid/ask, must never be context
-    sizes = sample_context_sizes(n_context, n, dist=size_dist, group=size_group)
-    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, sizes + n_heldout, n_samples=n, valid_mask=valid_mask)
+    # this path draws n_context + n_heldout DISTINCT points, i.e. nearly the whole grid, so a
+    # surface with too many NaN cells cannot be sampled at all. Heston's deep-OTM/short-tau
+    # corner occasionally loses enough (heavy-tailed: ~1 cell typically, >75 rarely) to fall
+    # short. Redraw those rather than crash - a mild, deliberate truncation of the Heston
+    # parameter prior away from its most degenerate corner. SSVI never has NaN, so this is a
+    # no-op there.
+    need = sizes + n_heldout
+    for _ in range(20):
+        bad = np.flatnonzero(valid_mask.sum(1) < need)
+        if not len(bad):
+            break
+        _, repl = generate_surfaces(cfg, len(bad))
+        surfaces[bad] = repl
+        valid_mask[bad] = ~np.isnan(repl).reshape(len(bad), -1)
+    else:
+        raise RuntimeError(f"{len(bad)} surfaces still short of {need[bad].max()} valid grid "
+                            f"points after 20 redraws; lower n_heldout ({n_heldout})")
+    k_idx, t_idx = sample_sparse_points(g.zs, g.ttms, need, n_samples=n, valid_mask=valid_mask)
     regimes = _sample_regimes(noise_cfg, n, regime)
     rhos = _sample_rhos(n, rho)
 
