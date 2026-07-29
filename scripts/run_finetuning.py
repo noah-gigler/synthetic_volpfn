@@ -79,15 +79,16 @@ EXPERIMENTS = {
         provider=lambda cfg, n_ctx, rho: partial(
             noisy_data_preparation, cfg, n_context=n_ctx, size_group=GROUP_SIZE, rho=rho),
         val=_supervised_val,
-        loss=lambda cfg: None,
+        loss=lambda cfg, **kw: None,
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=128,
     ),
     "arb": dict(
         provider=lambda cfg, n_ctx, rho: partial(
             quote_data_preparation, cfg, n_context=n_ctx, n_heldout=N_HELDOUT, size_group=GROUP_SIZE, rho=rho),
         val=_arb_val,
-        loss=lambda cfg: partial(quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0,
-                                 lambda_reg_z=0.01, lambda_reg_r=0.01, return_parts=True),
+        loss=lambda cfg, lambda_mean_hinge=0.0, **kw: partial(
+            quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0, lambda_reg_z=0.01,
+            lambda_reg_r=0.01, lambda_mean_hinge=lambda_mean_hinge, return_parts=True),
         group_size=GROUP_SIZE, batch_size=BATCH_SIZE, val_group_size=GROUP_SIZE,
     ),
 }
@@ -364,6 +365,13 @@ def main():
                          "LEGACY NOISE for now - the calibration is still being validated (see "
                          "notes/results_summary.md), so every run stays comparable to the existing "
                          "results unless this is passed explicitly")
+    p.add_argument("--lambda-mean-hinge", type=float, default=0.0,
+                    help="arb only: squared-distance hinge pulling the bar-distribution mean back "
+                         "inside [bid, ask] when it strays outside - the interval NLL only rewards "
+                         "probability mass in the interval, not where the mean sits, which is what "
+                         "a low ins%%/inside_spread_fraction means. 0 disables (default, matches "
+                         "prior behaviour exactly). Truth-free: uses only observed bid/ask, and "
+                         "excludes is_point rows so it can't reintroduce a supervised MSE term")
     args = p.parse_args()
 
     spec = EXPERIMENTS[args.experiment]
@@ -387,7 +395,7 @@ def main():
     if not args.eval_only:
         val_data = load_val(args.experiment, cfg, rebuild=args.rebuild_val, rho=rho, legacy=legacy_noise)
         data_provider = spec["provider"](cfg, tuple(args.n_context), rho)
-        loss_fn = crps_only_loss if args.crps_only else spec["loss"](cfg)
+        loss_fn = crps_only_loss if args.crps_only else spec["loss"](cfg, lambda_mean_hinge=args.lambda_mean_hinge)
         init_state = None
         if args.init_from is not None:
             init_state = torch.load(ROOT / "checkpoints" / args.init_from / "final.pt", map_location=args.device)

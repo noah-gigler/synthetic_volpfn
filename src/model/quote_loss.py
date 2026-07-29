@@ -11,7 +11,8 @@ from src.data_generation.grid import arb_grid_shape
 
 def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
                    lambda_bf=10.0, lambda_reg_z=0.0, lambda_reg_r=0.0,
-                   eps_bf=0.0, eps_cal=0.0, min_prob=1e-6, return_parts=False):
+                   lambda_mean_hinge=0.0, eps_bf=0.0, eps_cal=0.0, min_prob=1e-6,
+                   return_parts=False):
     # returns per-surface losses (G,) for a possibly grouped batch (G surfaces, E estimators).
     # row layout is fixed and positional (see grid.py's sample_arb_grid/arb_grid_shape docstring):
     # query = [n_rb*n_zb butterfly rows | (n_rc-1)*n_zc cal_lo rows | (n_rc-1)*n_zc cal_hi rows | held-out rows]
@@ -40,7 +41,7 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
     tau_hi = batch.X_query_raw[0, hi_sl, 1].to(logits_BQL.device).reshape(n_rc - 1, n_zc)[:, 0]
     r_lo, r_hi = tau_lo.sqrt().view(1, -1, 1), tau_hi.sqrt().view(1, -1, 1)
 
-    losses, nlls, cals, bfs, reg_zs, reg_rs = [], [], [], [], [], []
+    losses, nlls, cals, bfs, reg_zs, reg_rs, mean_hinges = [], [], [], [], [], [], []
     for g in range(G):
         logits = logits_BQL[g * E:(g + 1) * E]
         bardist = znorm_bardists[g]
@@ -105,17 +106,53 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
             reg_z = torch.zeros((), device=logits_BQL.device)
             reg_r = torch.zeros((), device=logits_BQL.device)
 
+        # pulls the point estimate (bar-distribution mean) back inside [bid, ask] when it
+        # strays outside - the interval NLL only rewards probability MASS between bid/ask, not
+        # where the mean sits, so a skewed predictive distribution can satisfy the NLL while its
+        # mean is still outside the spread (this is exactly what a low ins%/inside_spread_fraction
+        # means). Zero gradient once the mean is inside (a hinge, not a Tikhonov regularizer like
+        # reg_z/reg_r - it won't keep pushing after the constraint is met). Excludes is_point rows
+        # (regime=0's bid=ask=true) on purpose: those equal the true price, so hinging against them
+        # would silently reintroduce a truth-supervised MSE term through the back door.
+        n_hi = mask & ~is_point
+        if lambda_mean_hinge and n_hi.any():
+            # y_query_raw is NaN on arb-grid rows (only held-out rows carry real bid/ask); relu(NaN
+            # - iv) is NaN regardless of downstream masking, and that NaN still backprops through
+            # the shared forward pass into every query position's logits, corrupting the whole model
+            # on the very first step even though the visible mean_hinge value looks finite (the NaN
+            # rows are excluded from it via indexing, but NOT from the gradient without this fix) -
+            # replace NaN with a safe finite dummy BEFORE the relu, same principle as `safe` above
+            y_raw = torch.nan_to_num(batch.y_query_raw[g].to(logits_BQL.device), nan=0.0)
+            below = torch.relu(y_raw[:, 0] - iv)
+            above = torch.relu(iv - y_raw[:, 1])
+            mean_hinge = (below**2 + above**2)[:, n_hi].mean()
+            # n_hi.any() guards a real, not-just-theoretical case: at regime=0 EVERY held-out row
+            # is_point (zero-width, bid=ask=true - see add_quote_noise's hard early-return), and
+            # _split_by_regime concatenates each regime as a contiguous block before group_size
+            # packing groups consecutive same-size surfaces together - so a whole val group can
+            # legitimately have zero genuine (nonzero-width) interval rows. Without this guard,
+            # `[:, n_hi].mean()` over an empty selection silently returns NaN (a real PyTorch
+            # footgun, not an error), which is exactly what made every val_loss slot read NaN
+            # despite training looking perfectly healthy - training only avoids it by luck (random
+            # per-epoch draws rarely land a whole group in one regime), validation hits it every
+            # single time because the frozen val list's regime blocks are deterministic.
+        else:
+            mean_hinge = torch.zeros((), device=logits_BQL.device)
+
         losses.append(nll + lambda_cal * cal + lambda_bf * bf
-                      + lambda_reg_z * reg_z + lambda_reg_r * reg_r)
+                      + lambda_reg_z * reg_z + lambda_reg_r * reg_r
+                      + lambda_mean_hinge * mean_hinge)
         nlls.append(nll)
         cals.append(cal)
         bfs.append(bf)
         reg_zs.append(reg_z)
         reg_rs.append(reg_r)
+        mean_hinges.append(mean_hinge)
 
     total = torch.stack(losses)
     if return_parts:
         parts = {"nll": torch.stack(nlls), "cal": torch.stack(cals), "bf": torch.stack(bfs),
-                 "reg_z": torch.stack(reg_zs), "reg_r": torch.stack(reg_rs)}
+                 "reg_z": torch.stack(reg_zs), "reg_r": torch.stack(reg_rs),
+                 "mean_hinge": torch.stack(mean_hinges)}
         return total, parts
     return total
