@@ -155,7 +155,9 @@ def main():
                         "with --eval-only this evaluates that checkpoint zero-shot")
     p.add_argument("--which", default="final", choices=["final", "best"])
     p.add_argument("--eval-only", action="store_true")
-    p.add_argument("--pool", default="val", choices=["val", "test"])
+    p.add_argument("--pool", default="val", choices=["val", "test", "train"],
+                    help="'train' scores in-sample, on the same days the model (and the global "
+                         "y-rescale constants) were fitted on - the in/out-of-period control")
     p.add_argument("--start", default="2020-01-01")
     # parquet currently covers 2020-2023 contiguously plus a few stray 2026 days; default end
     # keeps the split inside the contiguous block
@@ -186,6 +188,12 @@ def main():
                          "synthetic prior (see config.yaml)")
     p.add_argument("--feature-zscore", action="store_true",
                     help="also z-score z/tau input features globally, using the same --y-source")
+    p.add_argument("--lambda-reg-z", type=float, default=0.01,
+                    help="curvature regularizer in z. Unlike the cal/bf hinges (exactly 0 on any "
+                         "arb-free surface), this is minimized only at ZERO curvature, so it keeps "
+                         "pulling toward a flat surface after the no-arb constraint is met - real "
+                         "runs collapse to a constant output around epoch ~215 with it on. Set 0")
+    p.add_argument("--lambda-reg-r", type=float, default=0.01, help="same, in the sqrt(tau) direction")
     p.add_argument("--global-squashing", action="store_true",
                     help="robust median/IQR global rescale for y AND z/tau (same --y-source) "
                          "instead of mean/std - no clip (z/tau are already domain-bounded)")
@@ -216,7 +224,8 @@ def main():
         data_provider = partial(build_task, train_pool, n_context=tuple(args.n_context),
                                 cfg=cfg, n_heldout=N_HELDOUT, size_group=args.group_size, selffit=args.selffit)
         loss_fn = partial(quote_arb_loss, cfg=cfg, lambda_cal=10.0, lambda_bf=10.0,
-                          lambda_reg_z=0.01, lambda_reg_r=0.01, return_parts=True)
+                          lambda_reg_z=args.lambda_reg_z, lambda_reg_r=args.lambda_reg_r,
+                          return_parts=True)
         finetune(
             data_provider, run_name=args.run_name, n_epochs=args.epochs,
             n_surfaces_per_epoch=args.n_surfaces, batch_size=args.batch_size,
@@ -230,7 +239,7 @@ def main():
     else:
         eval_run_name = args.init_from or args.run_name
 
-    pool = val_pool if args.pool == "val" else test_pool
+    pool = {"train": train_pool, "val": val_pool, "test": test_pool}[args.pool]
     run_eval(eval_run_name, pool, args.pool, cfg, args.device,
              which=args.which, rebuild_eval=args.rebuild_eval, baseline_jobs=args.baseline_jobs,
              y_mean=y_mean, y_scale=y_scale, feature_scale=feature_scale)
