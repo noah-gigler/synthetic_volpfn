@@ -10,8 +10,8 @@ from src.data_generation.grid import arb_grid_shape
 
 
 def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
-                   lambda_bf=10.0, lambda_reg_z=0.0,
-                   lambda_reg_r=0.0, min_prob=1e-6, return_parts=False):
+                   lambda_bf=10.0, lambda_reg_z=0.0, lambda_reg_r=0.0,
+                   eps_bf=0.0, eps_cal=0.0, min_prob=1e-6, return_parts=False):
     # returns per-surface losses (G,) for a possibly grouped batch (G surfaces, E estimators).
     # row layout is fixed and positional (see grid.py's sample_arb_grid/arb_grid_shape docstring):
     # query = [n_rb*n_zb butterfly rows | (n_rc-1)*n_zc cal_lo rows | (n_rc-1)*n_zc cal_hi rows | held-out rows]
@@ -73,7 +73,13 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
 
         # calendar: total variance must increase across maturities at fixed strike k
         # (both slices already share k by construction, see grid.py sample_arb_grid)
-        cal = torch.relu(r_lo / r_hi - iv_hi / iv_lo.clamp_min(1e-3)).mean()
+        # eps_* turn the hinge into a MARGIN (require residual >= eps, not just >= 0). With the
+        # plain hinge the gradient vanishes the instant a cell crosses zero, so cells park just
+        # inside the boundary and cross back as the fit term pushes the surface around - which
+        # is why bf ~ 0.004 still corresponds to several % of violating cells. eps=0 reproduces
+        # the old behaviour exactly. NOTE: OpDS's released code uses eps as a TOLERANCE
+        # (relu(-g - eps)), the opposite sign; this follows their paper's text instead.
+        cal = torch.relu(eps_cal + r_lo / r_hi - iv_hi / iv_lo.clamp_min(1e-3)).mean()
 
         # butterfly: w = iv^2 * tau; at fixed tau d/dk = (1/rho)d/dz -> Gatheral g >= 0
         w = iv_b**2 * tau_b.view(1, n_rb, 1)
@@ -81,7 +87,7 @@ def quote_arb_loss(estimator, batch, logits_BQL, *, cfg, lambda_cal=10.0,
         w_zz = torch.gradient(w_z, spacing=(z_b,), dim=-1)[0]
         w_k, w_kk, k = w_z / r_b, w_zz / r_b**2, z_b.view(1, 1, n_zb) * r_b
         g_fn = (1 - k * w_k / (2 * w)) ** 2 - w_k**2 / 4 * (1 / w + 0.25) + w_kk / 2
-        bf = torch.relu(-g_fn).mean()
+        bf = torch.relu(eps_bf - g_fn).mean()
 
         # curvature regularizers (à la OpDS Loss.reg_z/reg_r): raw-IV roughness on the
         # butterfly grid, independent of whether a hinge actually fires - the mechanism
