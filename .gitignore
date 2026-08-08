@@ -19,3 +19,11 @@ wheels/
 .env
 
 report/
+slurm_logs/
+
+# internal working docs
+report_notes.md
+CLAUDE.md
+notes/
+!notes/tabpfn_preprocessing_ablation.md
+assets/
